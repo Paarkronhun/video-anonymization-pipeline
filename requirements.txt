@@ -3,3 +3,6 @@ numpy>=1.23.0
 # OpenCV might require other dependencies depending on your OS.
 # If you use a deep learning model (YOLO), you will add:
 # opencv-contrib-python
+torch==2.7.0
+torchvision==0.22.0
+ultralytics==8.3.123
