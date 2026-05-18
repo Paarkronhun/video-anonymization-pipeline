@@ -3,6 +3,12 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+#Video files
+*.mp4
+*.avi
+*.mov
+*.mkv
+
 # C extensions
 *.so
 
