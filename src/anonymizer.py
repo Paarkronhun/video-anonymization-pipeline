@@ -5,6 +5,7 @@ import numpy as np
 import logging
 # >>> VITAL IMPORTS <<<
 import torch
+import math
 # If you install ultralytics model:
 # from ultralytics import YOLO 
 # ========================
@@ -39,35 +40,55 @@ class YoloDetector:
             
     def detect(self, frame: np.ndarray, mode: str) -> list[tuple[int, int, int, int]]:
         """
-        Runs detection inference on the frame and filters results by mode.
-        Returns a list of (x, y, w, h) tuples.
+        [SIMULATION MODE] Simulates tracking an object moving in a defined pattern.
+        In a real scenario, this function performs YOLO model inference.
+        
+        Returns a list of (x, y, w, h) tuples representing the detected boxes.
         """
-        if not self.model_initialized:
-            logging.error("Detector is not initialized due to model loading failure.")
-            return []
-            
-        logging.info(f"Running robust inference in '{mode}' mode...")
+        from time import time
+        current_time = time()
         
-        # ===============================================================
-        # <<< THIS ENTIRE BLOCK MUST BE REPLACED BY REAL PYTORCH CODE >>>
-        # ===============================================================
+        # 1. Calculate a time-based movement factor (The "clock")
+        elapsed_time = current_time 
         
-        # For tutorial stability, we keep the simulation:
+        logging.info("!!! SIMULATION MODE ACTIVE: Generating mock movement data for testing visibility. !!!")
         
-        if mode == 'faces_only':
-            # Placeholder for two faces found by YOLO
-            return [
-                (200, 150, 150, 150), 
-                (50, 250, 120, 120)   
-            ]
-        elif mode == 'full_bbox':
-            # Placeholder for two full bodies found by YOLO
-            return [
-                (50, 100, 250, 450),
-                (350, 50, 180, 400)
-            ]
-        else:
-            return []
+        # --- SIMULATION: CIRCULAR PATH ---
+        # This generates a box following a path that moves in a circle over time.
+        # Math.sin() and math.cos() are used to create smooth, repetitive movement.
+        
+        # Defining the theoretical path center (The center of the circle)
+        center_x = 300
+        center_y = 250
+        radius = 150
+        
+        # Current angle based on global time (the movement factor)
+        angle = elapsed_time * 2.0 # Speed factor
+        
+        # Calculate the simulated center point based on the circle math
+        sim_center_x = center_x + (radius * math.cos(angle))
+        sim_center_y = center_y + (radius * math.sin(angle))
+        
+        # Define the size of the object bounding box
+        box_size = 100 
+        
+        # Calculate the final bounding box coordinates (x_min, y_min, x_max, y_max)
+        x_min = int(sim_center_x - (box_size / 2))
+        y_min = int(sim_center_y - (box_size / 2))
+        x_max = int(sim_center_x + (box_size / 2))
+        y_max = int(sim_center_y + (box_size / 2))
+        
+        # Ensure coordinates are valid (e.g., within frame boundaries)
+        # This prevents crashes if the simulated box goes off the edge.
+        x_min = max(0, x_min)
+        y_min = max(0, y_min)
+        x_max = min(frame.shape[1], x_max)
+        y_max = min(frame.shape[0], y_max)
+
+        # The required return format remains (x, y, w, h)
+        return [(x_min, y_min, x_max - x_min, y_max - y_min)]
+
+        # --- END Simulation ---
 
 # =======================================================================
 # 2. CORE MYSTERY BOX HELPER FUNCTIONS (Masking and Detection Wrapper)
@@ -86,19 +107,27 @@ def _detect_objects(frame: np.ndarray, mode: str) -> list[tuple[int, int, int, i
 
 
 def _mask_object(frame: np.ndarray, bbox: tuple[int, int, int, int], method: str = 'blur') -> np.ndarray:
-    """ Applies masking effect to a specified bounding box using OpenCV. """
-    # (Masking logic remains perfect - no changes needed)
+    """
+    Applies masking effect to a specified bounding box.
+    Modifies the frame in-place (or returns a modified copy).
+    """
     x, y, w, h = bbox
+    
+    # 1. Extract the region of interest (ROI)
     roi = frame[y:y+h, x:x+w]
     
+    # 2. Apply Masking Technique
     if method == 'blur':
-        mask_strength = 8 
+        # FIX: Changed the strength to 7 (an odd number) to pass OpenCV's requirement.
+        mask_strength = 7 
         masked_roi = cv2.GaussianBlur(roi, (mask_strength, mask_strength), 0)
     elif method == 'solid':
+        # Creates a solid black/colored box
         masked_roi = np.zeros_like(roi)
     else: 
-        masked_roi = roi
+        masked_roi = roi # No masking applied
         
+    # 3. Place the masked ROI back into the original frame
     frame[y:y+h, x:x+w] = masked_roi
     return frame
 
@@ -122,6 +151,6 @@ def anonymize_frame(frame: np.ndarray, mode: str) -> np.ndarray:
     anonymized_frame = frame.copy()
     
     for bbox in bounding_boxes:
-        anonymized_frame = _mask_object(anonymized_frame, bbox, method='blur')
+        anonymized_frame = _mask_object(anonymized_frame, bbox, method='solid')
         
     return anonymized_frame

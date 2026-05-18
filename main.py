@@ -3,49 +3,111 @@
 import cv2
 import numpy as np
 import logging
-# Ensure this import can find our core logic module
+import argparse # NEW: Library to handle command-line arguments
 from src.anonymizer import anonymize_frame
 
 # --- Setup basic logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-def process_single_image(input_path: str, output_path: str, anon_mode: str):
+def load_video(input_path: str) -> cv2.VideoCapture | None:
     """
-    Function to process and anonymize a single static image file.
-    This replaces the video reading functionality for testing purposes.
+    Attempts to open a video source (file or stream).
+    Returns the video capture object or None if opening fails.
     """
-    logging.info(f"Attempting to load static image from: {input_path}")
+    logging.info(f"Attempting to load video from: {input_path}")
     
-    # 1. Load the single image
-    frame = cv2.imread(input_path)
-    if frame is None:
-        logging.error(f"FATAL ERROR: Could not load image from {input_path}. Check path and file integrity.")
+    cap = cv2.VideoCapture(input_path)
+    
+    # Check the failure conditions
+    if not cap.isOpened():
+        logging.error(f"FATAL ERROR: Could not open video source at {input_path}.")
+        logging.error("Check file paths, URL format, and required dependencies.")
+        return None
+    
+    logging.info("Video source successfully opened.")
+    return cap
+
+def run_pipeline(input_source: str, output_path: str, anon_mode: str):
+    """
+    The main orchestration function. Handles I/O and guarantees resource cleanup.
+    (Logic remains the same, it's the entry point that changes)
+    """
+    # 1. Setup and Load the video
+    cap = load_video(input_source)
+    if cap is None:
         return
+        
+    # 2. Setup output video writer
+    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = cap.get(cv2.CAP_PROP_FPS) 
     
-    logging.info("Image source successfully loaded.")
+    # Use 'mp4v' codec for maximum compatibility
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v') 
+    out = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
 
-    # 2. Process and anonymize the image (The core logic is called here)
-    anonymized_frame = anonymize_frame(frame, anon_mode) 
+    frame_count = 0
+    print("="*50)
+    print(f"STARTING ANONYMIZATION: Mode={anon_mode}")
+    print("="*50)
 
-    # 3. Save the output image
-    cv2.imwrite(output_path, anonymized_frame)
+    # Use a try...finally block to guarantee resource cleanup
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break # The loop breaks upon reaching the end of the video stream
+
+            # Core call to our advanced logic
+            anonymized_frame = anonymize_frame(frame, anon_mode) 
+
+            # Write the processed frame
+            out.write(anonymized_frame)
+            frame_count += 1
+
+    except Exception as e:
+        # If any unknown error happens during the loop, we catch it and log it.
+        logging.critical(f"\n[PIPELINE FAILURE] Process interrupted due to an error: {e}")
     
-    logging.info("Image processing complete.")
-    print(f"\n✅ Success! Anonymized image saved to: {output_path}")
+    finally:
+        # The 'finally' block runs NO MATTER WHAT—success, break, or error.
+        logging.info("---- STARTING CLEANUP SEQUENCE ----")
+        cap.release() # Release the video reader
+        out.release() # Release the output writer
+        logging.info("Video resources fully released. Pipeline finished.")
+        print(f"\n✅ Success! {frame_count} frames processed and saved to {output_path}")
 
 
 if __name__ == "__main__":
-    # --- USER CONFIGURATION SECTION (MUST BE EDITED BY USER) ---
+    # Initialization of the argument parser
+    parser = argparse.ArgumentParser(
+        description="A robust pipeline for video anonymization using deep learning object detection.",
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     
-    # 1. Define the path to your test image input
-    INPUT_SOURCE = "data/frame_test.jpg" 
+    # Define required arguments
+    parser.add_argument(
+        '--input', 
+        type=str, 
+        required=True, 
+        help="Path to the video file or a live streaming URL (e.g., 'data/input.mp4')."
+    )
+    parser.add_argument(
+        '--output', 
+        type=str, 
+        required=True, 
+        help="Output file path for the anonymized video (e.g., 'output/anon.mp4')."
+    )
+    parser.add_argument(
+        '--mode', 
+        type=str, 
+        default='faces_only', 
+        choices=['faces_only', 'full_bbox'],
+        help="The mode of anonymization: 'faces_only' (default) or 'full_bbox'."
+    )
     
-    # 2. Define the output file path for the resulting image
-    OUTPUT_FILE = "output_anon/test_anon_output.jpg" 
+    # Parse the arguments provided by the user in the terminal
+    args = parser.parse_args()
     
-    # 3. Define the anonymization mode ('faces_only' or 'full_bbox')
-    ANON_MODE = 'faces_only' 
-    # ----------------------------------------------------------
-    
-    # Execute the single image test run
-    process_single_image(INPUT_SOURCE, OUTPUT_FILE, ANON_MODE)
+    # Run the pipeline using the values passed from the terminal
+    run_pipeline(args.input, args.output, args.mode)
