@@ -1,8 +1,12 @@
+# requirements.txt
+
+# --- Core CV and Math Libraries ---
 opencv-python>=4.5.5
 numpy>=1.23.0
-# OpenCV might require other dependencies depending on your OS.
-# If you use a deep learning model (YOLO), you will add:
-# opencv-contrib-python
+
+# --- Deep Learning Frameworks (Choose ONE major back-end) ---
+# Recommendation: Use torch for the best performance with modern YOLO models.
 torch==2.7.0
 torchvision==0.22.0
-ultralytics==8.3.123
+# For running YOLO models efficiently, using ultralytics is highly recommended.
+ultralytics==8.3.123 
