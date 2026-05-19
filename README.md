@@ -1,87 +1,95 @@
-# 🎥 Video Anonymization Pipeline
+# 🎥 Video Anonymization Pipeline: Advanced Tracking and Privacy Enforcement
 
-**Project Goal:** Developing a robust framework for processing video streams to detect and obscure personally identifiable information (PII), ensuring data privacy and compliance.
+## 📋 Project Goal
+To develop a robust, state-of-the-art framework for processing video streams to detect, track, and securely obscure Personally Identifiable Information (PII), ensuring maximum data privacy and compliance with global regulations (e.g., GDPR).
 
-## 📋 Description
+## ✨ Key Features & Enhancements
+This pipeline is a sophisticated solution designed to process high-resolution video feeds, whether from local files or simulated live streams.
 
-This pipeline is a sophisticated solution designed to process video feeds, whether from local files or live streaming URLs. Its primary function is the robust anonymization of sensitive data, specifically focusing on human faces and bounding boxes.
-
-The system operates under a strict privacy protocol, ensuring that the original, identifiable source material is securely handled or deleted after the anonymization process is complete.
-
-### ✨ Key Features
-
-*   **Multi-Source Input:** Accepts local video files or live/recorded video streams from HTTPS URLs.
-*   **Targeted Anonymization:** Supports granular control over the anonymization level:
-    *   `faces_only`: Blurs or pixelates only detected facial regions.
-    *   `full_bbox`: Obscures the entire bounding box around the detected subject.
-*   **Data Hygiene:** Implement a mechanism for the secure handling and eventual deletion of the original sensitive video data.
-*   **Modularity:** The core logic is separated, allowing for easy integration of new detection algorithms (e.g., switching from Haar Cascades to a modern deep learning model like YOLO).
+*   **Deep Object Detection & Tracking:** Utilizes **YOLOv8/YOLOv11** for initial detection combined with **Kalman Filtering** and **Deep Sort** tracking algorithms. This ensures persistent identification of subjects across multiple frames, even during brief occlusions or camera movements.
+*   **Targeted Anonymization Modes:**
+    *   `face`: Blurs or pixelates a defined region around the detected human face.
+    *   `body`: Obscures the entire bounding box of the detected subject (full body).
+*   **Multi-Source Input:** Accepts local video files or can be architected for live/recorded video streams from HTTPS URLs.
+*   **Data Hygiene and Compliance:** Implements a structured workflow that confirms the secure handling and eventual deletion/archiving of the original sensitive video data, adhering to "Privacy by Design" principles.
+*   **Modular Design:** The core logic separates detection, tracking, and masking, allowing easy integration of advanced ML models (e.g., switching from YOLO to a specialized facial recognition model).
 
 ## 🏗️ System Architecture and Workflow
 
-The process follows a secure, three-stage pipeline:
+The pipeline operates through a secure, three-stage system, leveraging object tracking for superior accuracy.
 
-1.  **Input Stage (The Stream/Source):**
-    *   The system first handles the data acquisition. If a URL is provided, it uses streaming protocols to capture frames efficiently. If a local file is provided, it loads the file.
-2.  **Core Processing Stage (Anonymization):**
-    *   The system reads the video frame by frame.
-    *   **Detection:** An Object Detection algorithm (e.g., OpenCV's DNN/Haar) identifies the coordinates of faces or full bodies.
-    *   **Transformation:** Based on the selected mode (`faces_only` or `full_bbox`), the system applies a masking technique (e.g., Gaussian blur, pixelation) to the detected areas of the current frame.
-    *   The masked frames are then re-assembled into a new video stream.
-3.  **Output Stage (Clean-up):**
-    *   The anonymized video is saved to a specified output path.
-    *   Crucially, the pipeline confirms the secure deletion/archiving of the original source footage, preventing data retention risks.
+### 1. Input Stage (Source Acquisition)
+The system handles data acquisition.
+*   **File Input:** Loads local video files (`.mp4`, etc.).
+*   **Stream Input (Planned):** Optimized to handle streaming protocols, reading frames efficiently for real-time processing.
+
+### 2. Core Processing Stage (Tracking & Anonymization)
+This is the heart of the system, executed frame-by-frame.
+
+*   **Detection (YOLO):** An optimized model identifies potential subjects (persons) and generates initial bounding boxes.
+*   **Tracking (Kalman Filter):** The tracking mechanism maintains a persistent ID for each detected object. When a subject is briefly lost or the detection confidence drops, the system uses the Kalman Filter to predict the object's next location and reacquire the bounding box, ensuring smoother, more consistent anonymization.
+*   **Transformation (Masking):** Based on the user-defined mode (`face` or `body`), the system applies masking techniques (e.g., solid black overlay, pixelation) to the tracked bounding box on the current frame.
+*   **Reassembly:** The newly masked frames are efficiently written to a new output video stream.
+
+### 3. Output Stage (Clean-up and Output)
+*   The fully anonymized video is saved to the specified output path.
+*   **Compliance Protocol:** The pipeline logs the completion and confirmation of the original source material's secure deletion/archiving, ensuring a complete audit trail.
 
 ## 🚀 Installation and Usage
 
 ### Prerequisites
 *   Python 3.8+
 *   `git` (Version Control)
+*   A CUDA-enabled GPU (Highly recommended for real-time performance)
 
 ### Installation Steps
 1.  **Clone the Repository:**
     ```bash
-    git clone [Your GitHub Repo URL]
+    git clone https://github.com/Paarkronhun/video-anonymization-pipeline
     cd video-anonymization-pipeline
     ```
-2.  **Set Up Virtual Environment (Highly Recommended):**
+2.  **Set Up Virtual Environment:**
     ```bash
     python -m venv venv
-    source venv/bin/activate  # On Linux/Mac
-    # venv\Scripts\activate   # On Windows
+    source venv/bin/activate   # On Linux/Mac
+    # venv\Scripts\activate    # On Windows
     ```
 3.  **Install Dependencies:**
+    *(Note: These dependencies include `torch`, `ultralytics`, and `opencv-python`)*
     ```bash
-    pip install -r DOCUMENTATION/requirements.txt
+    pip install -r requirements.txt
     ```
 
 ### Usage Guide (Running the Pipeline)
 
-The entry point is `src/anonymizer.py`. You must define your input source (`--input`) and the anonymization strategy (`--mode`).
+The primary entry point is `main.py`. You must define your input source, output path, and the desired anonymization strategy.
 
-#### A. From a Live/Online Stream (HTTPS)
-Use this method when processing data from the web.
-
-```bash
-python src/anonymizer.py \
-    --input "https://stream.example.com/live/feed" \
-    --mode faces_only \
-    --output output_anon/stream_anon.mp4
-```
-
-#### B. From a Local Video File
+**A. From a Local Video File**
 Use this method when you have downloaded the video source.
 
 ```bash
-python src/anonymizer.py \
+python main.py \
     --input data/local_video_source.mp4 \
-    --mode full_bbox \
-    --output output_anon/local_anon.mp4
+    --output data/local_anon.mp4 \
+    --mode body
 ```
 
+**B. From a Live/Online Stream (Future Implementation)**
+When adapted for streaming, the input path will point to the stream URL, and the processing loop will run continuously until interrupted.
 
+```bash
+# Example syntax for a live feed (implementation pending advanced stream reader)
+python main.py \
+    --input "rtsp://ip_address:port" \
+    --output data/live_anon.mp4 \
+    --mode face
+```
 
-1.  **Formatting:** It uses Markdown headers (`#`, `##`, `###`) and code blocks (` ``` `), which is standard for GitHub.
-2.  **Clarity:** It separates *What it does* (Description) from *How it works* (Architecture) from *How to run it* (Usage).
-3.  **Technical Depth:** By mentioning streaming protocols and compliance (RGPD), you show that you understand the depth of the problem, not just the code.
-4.  **Completeness:** The inclusion of a "Future Roadmap" makes the project look ambitious and scalable.
+***
+
+### 🎯 Technical Notes & Design Decisions
+
+*   **Object Tracking Robustness:** By using a combination of YOLO detection and Kalman filtering, the system moves beyond simple frame-by-frame detection. It maintains a *track* of the individual, which is critical for masking consistency when subjects move quickly or briefly exit the frame.
+*   **Scalability:** The detection layer is encapsulated within the `YoloDetector` class, making it trivial to swap out the backbone model (e.g., replacing YOLO with a specialized facial recognition API without changing the core anonymization logic).
+*   **Resource Management:** The `main.py` structure includes explicit `try...finally` blocks to ensure that both the video capture object (`cap`) and the video writer object (`out`) are always correctly released, preventing resource leaks.
+*   **Error Handling:** The inclusion of detailed logging and exception handling ensures that the pipeline gracefully fails and reports the exact point of failure.
