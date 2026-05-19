@@ -155,11 +155,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--mode",
         type=str,
-        default="full_bbox",
-        choices=["full_bbox", "blur"],
-        help="Anonymization mode"
+        required=True,
+        choices=["face", "body"],
+        help="""
+        face -> censor only face
+        body -> censor entire body
+        """
     )
-
     args = parser.parse_args()
 
     run_pipeline(
