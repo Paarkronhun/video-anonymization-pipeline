@@ -23,7 +23,7 @@ class YoloDetector:
     def __init__(
         self,
         model_path: str = "models/yolo11x.pt",
-        conf_threshold: float = 0.10,
+        conf_threshold: float = 0.20,
         imgsz: int = 1280
     ):
         self.tracked_objects = {}
