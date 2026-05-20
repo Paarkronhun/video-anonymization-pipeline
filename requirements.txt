@@ -7,7 +7,7 @@ numpy<2
 # --- Deep Learning Frameworks (Choose ONE major back-end) ---
 # Recommendation: Use torch for the best performance with modern YOLO models.
 
---index-url https://download.pytorch.org/whl/cu126
+--extra-index-url https://download.pytorch.org/whl/cu126
 torch==2.7.0
 torchvision==0.22.0+cu126
 
