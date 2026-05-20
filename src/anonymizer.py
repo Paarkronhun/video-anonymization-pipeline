@@ -23,19 +23,14 @@ class YoloDetector:
     def __init__(
         self,
         model_path: str = "models/yolo11x.pt",
-        conf_threshold: float = 0.20,
+        conf_threshold: float = 0.35,       # was 0.20 — reduces false positives
         imgsz: int = 1280
     ):
         self.tracked_objects = {}
-        self.max_missing_frames = 15
+        self.max_missing_frames = 10        # was 15 — drop stale ghosts faster
 
-        # --------------------------------------------------
-        # LIMIT PREDICTION EXPANSION
-        # --------------------------------------------------
-
-        self.max_prediction_growth = 1.01   # very small growth
-        self.max_size_multiplier = 1.15     # max 15% larger than original
-
+        self.max_prediction_growth = 1.005  # was 1.01
+        self.max_size_multiplier = 1.10     # was 1.15
         self.model_path = model_path
         self.conf_threshold = conf_threshold
         self.imgsz = imgsz
@@ -80,7 +75,6 @@ class YoloDetector:
     # ======================================================
 
     def _create_kalman_filter(self, x, y):
-
         kf = cv2.KalmanFilter(4, 2)
 
         kf.transitionMatrix = np.array([
@@ -95,17 +89,12 @@ class YoloDetector:
             [0, 1, 0, 0]
         ], dtype=np.float32)
 
-        kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.03
-
-        kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 0.5
-
+        kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.1    # was 0.03 — more responsive
+        kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 0.1 # was 0.5 — trust detections more
         kf.errorCovPost = np.eye(4, dtype=np.float32)
 
         kf.statePost = np.array([
-            [x],
-            [y],
-            [0.0],
-            [0.0]
+            [x], [y], [0.0], [0.0]
         ], dtype=np.float32)
 
         return kf
@@ -115,23 +104,7 @@ class YoloDetector:
     # ======================================================
 
     def _enhance_frame(self, frame):
-
-        h, w = frame.shape[:2]
-
-        if w < 1280:
-
-            scale = 1280 / w
-
-            new_w = int(w * scale)
-            new_h = int(h * scale)
-
-            frame = cv2.resize(
-                frame,
-                (new_w, new_h),
-                interpolation=cv2.INTER_CUBIC
-            )
-
-        return frame
+        return frame  # let YOLO handle resizing natively via imgsz
 
     # ======================================================
     # DETECTION
@@ -162,7 +135,8 @@ class YoloDetector:
                 imgsz=self.imgsz,
                 conf=self.conf_threshold,
                 half=self.use_half,
-                iou=0.5,
+                iou=0.4,          # was 0.5 — catches overlapping people better
+                augment=True,     # test-time augmentation improves recall
                 verbose=False
             )
 
@@ -280,7 +254,7 @@ class YoloDetector:
 
                         prev = self.tracked_objects[track_id]["bbox"]
 
-                        alpha = 0.7
+                        alpha = 0.4
 
                         smooth_box = (
                             int(prev[0] * alpha + current_box[0] * (1 - alpha)),
@@ -384,14 +358,14 @@ def _mask_object(
 
     if mode == "face":
 
-        face_x = x + int(w * 0.18)
-        face_y = y
+        face_x = x + int(w * 0.10)        # was 0.18 — wider crop
+        face_y = y - int(h * 0.05)        # start slightly above bbox top
 
-        face_w = int(w * 0.64)
-        face_h = max(40, int(h * 0.28))
+        face_w = int(w * 0.80)            # was 0.64 — covers full head width
+        face_h = max(50, int(h * 0.38))   # was 0.28 — covers forehead + chin
 
-        pad_x = int(face_w * 0.15)
-        pad_y = int(face_h * 0.20)
+        pad_x = int(face_w * 0.10)
+        pad_y = int(face_h * 0.15)
 
         face_x -= pad_x
         face_y -= pad_y
