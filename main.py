@@ -37,7 +37,7 @@ def load_video(input_path: str):
 # ==========================================================
 
 def run_pipeline(input_source: str, output_path: str, anon_mode: str):
-
+    
     cap = load_video(input_source)
 
     if cap is None:
@@ -54,10 +54,12 @@ def run_pipeline(input_source: str, output_path: str, anon_mode: str):
 
     if fps <= 0:
         fps = 30
-
+        
+    
     logging.info(f"Resolution: {frame_width}x{frame_height}")
     logging.info(f"FPS: {fps}")
-
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    logging.info(f"Total frames: {total_frames}")
     # ------------------------------------------------------
     # Video writer
     # ------------------------------------------------------
@@ -105,7 +107,7 @@ def run_pipeline(input_source: str, output_path: str, anon_mode: str):
             frame_count += 1
 
             if frame_count % 30 == 0:
-                logging.info(f"Processed {frame_count} frames")
+                logging.info(f"Processed {frame_count}/{total_frames} frames | Progress {round(frame_count/total_frames*1000)/10} %")
 
     except KeyboardInterrupt:
         logging.warning("Interrupted by user.")
