@@ -43,21 +43,126 @@ KP_RIGHT_ANKLE = 16
 COLOR_ADULT = (0,   0,   0)    # Black  — adult
 COLOR_CHILD = (255, 255, 255)  # White  — child
 
-# Minimum confidence for a keypoint to be included in the hull
-KP_CONF_THRESHOLD = 0.3
+# ---------------------------------------------------------------------------
+# FIX 1 – KP confidence threshold lowered so partially visible keypoints
+# (e.g. a head cut off at the top of frame) still contribute to the hull.
+# ---------------------------------------------------------------------------
+KP_CONF_THRESHOLD = 0.15   # was 0.3
 
 # Radius (in pixels) added around each keypoint before computing
 # the convex hull.  Accounts for body thickness — torso and limbs
 # are wider than a single point.  Scaled by bbox width so it
 # adapts to viewing distance automatically.
-HULL_RADIUS_RATIO = 0.12    # fraction of bbox width
+HULL_RADIUS_RATIO = 0.18   # was 0.12 — wider expansion for partial bodies
 
 # Minimum absolute radius so distant (small) detections still get
 # a reasonable hull expansion.
-HULL_RADIUS_MIN_PX = 6
+HULL_RADIUS_MIN_PX = 8    # was 6
 
 # CHILD_ASPECT_RATIO_MAX  —  w/h below this → child
 CHILD_ASPECT_RATIO_MAX = 0.15
+
+# ---------------------------------------------------------------------------
+# FIX 2 – Preprocessing parameters
+# ---------------------------------------------------------------------------
+CLAHE_CLIP_LIMIT   = 2.0   # contrast enhancement strength
+CLAHE_TILE_GRID    = (8, 8)
+
+# ---------------------------------------------------------------------------
+# FIX 3 – Multi-scale detection: run inference at two resolutions and merge.
+# Catches both large nearby persons AND small distant ones.
+# ---------------------------------------------------------------------------
+IMGSZ_PRIMARY   = 1280   # main pass  (same as before)
+IMGSZ_SECONDARY = 640    # second pass at smaller scale for broader context
+NMS_IOU_MERGE   = 0.40   # IoU threshold when merging two-pass boxes
+
+# ==========================================================
+# PREPROCESSING HELPERS
+# ==========================================================
+
+def _preprocess_frame(frame: np.ndarray) -> np.ndarray:
+    """
+    Apply CLAHE-based contrast enhancement so that low-light or low-contrast
+    persons (common in backgrounds) become easier to detect.
+
+    The enhancement is done only on the luminance channel (YCrCb) so colours
+    are preserved and the output stays a normal BGR frame.
+    """
+    ycrcb = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
+    y, cr, cb = cv2.split(ycrcb)
+
+    clahe = cv2.createCLAHE(
+        clipLimit=CLAHE_CLIP_LIMIT,
+        tileGridSize=CLAHE_TILE_GRID
+    )
+    y_eq = clahe.apply(y)
+
+    ycrcb_eq = cv2.merge([y_eq, cr, cb])
+    return cv2.cvtColor(ycrcb_eq, cv2.COLOR_YCrCb2BGR)
+
+
+def _upscale_small_frame(
+    frame: np.ndarray,
+    min_dim: int = 720
+) -> tuple[np.ndarray, float]:
+    """
+    If the shorter side of the frame is below *min_dim* pixels, upscale it
+    so YOLO has more pixels to work with on small/distant persons.
+    Returns (processed_frame, scale_factor).  scale_factor == 1.0 when no
+    upscaling is applied.
+    """
+    h, w = frame.shape[:2]
+    short = min(h, w)
+    if short >= min_dim:
+        return frame, 1.0
+
+    scale = min_dim / short
+    new_w = int(w * scale)
+    new_h = int(h * scale)
+    resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    return resized, scale
+
+
+# ==========================================================
+# NMS UTILITY  (used when merging multi-scale results)
+# ==========================================================
+
+def _nms_boxes(
+    boxes_xyxy: list[tuple],
+    scores: list[float],
+    iou_threshold: float = 0.40
+) -> list[int]:
+    """
+    Simple NMS that returns kept indices.
+    boxes_xyxy: list of (x1,y1,x2,y2)
+    """
+    if not boxes_xyxy:
+        return []
+
+    boxes  = np.array(boxes_xyxy, dtype=np.float32)
+    scores = np.array(scores,     dtype=np.float32)
+    x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+    areas  = (x2 - x1 + 1) * (y2 - y1 + 1)
+    order  = scores.argsort()[::-1]
+
+    keep = []
+    while order.size > 0:
+        i = order[0]
+        keep.append(int(i))
+
+        xx1 = np.maximum(x1[i], x1[order[1:]])
+        yy1 = np.maximum(y1[i], y1[order[1:]])
+        xx2 = np.minimum(x2[i], x2[order[1:]])
+        yy2 = np.minimum(y2[i], y2[order[1:]])
+
+        inter = np.maximum(0.0, xx2 - xx1 + 1) * np.maximum(0.0, yy2 - yy1 + 1)
+        iou   = inter / (areas[i] + areas[order[1:]] - inter)
+
+        inds  = np.where(iou <= iou_threshold)[0]
+        order = order[inds + 1]
+
+    return keep
+
 
 # ==========================================================
 # YOLO DETECTOR
@@ -68,9 +173,15 @@ class YoloDetector:
     def __init__(
         self,
         model_path: str = "models/yolo11x.pt",
-        conf_threshold: float = 0.35,
-        imgsz: int = 1280,
-        frame_skip: int = 2
+        # FIX 4 – conf lowered to 0.20 so distant/occluded persons are not
+        # silently dropped before tracking even sees them.
+        conf_threshold: float = 0.20,   # was 0.35
+        imgsz: int = IMGSZ_PRIMARY,
+        # FIX 5 – frame_skip set to 1 (every frame is a detection frame).
+        # Skipping frames is the single biggest source of missed anonymisation
+        # because persons visible on skipped frames only get Kalman-predicted
+        # masks that may drift off the actual body.
+        frame_skip: int = 1,            # was 2
     ):
         self.tracked_objects     = {}
         self.max_missing_frames  = 10
@@ -144,8 +255,12 @@ class YoloDetector:
     # EXTRACT FACE ROI FROM POSE KEYPOINTS
     # ======================================================
 
-    def _face_roi_from_keypoints(self, keypoints, frame_h, frame_w):
-
+    def _face_roi_from_keypoints(self, keypoints, frame_h, frame_w, bbox_h=None):
+        """
+        FIX 6 – When head keypoints are absent (person's head extends above
+        the frame, or is occluded), fall back to extrapolating the head
+        position from shoulder keypoints.
+        """
         head_indices = [
             KP_NOSE, KP_LEFT_EYE, KP_RIGHT_EYE,
             KP_LEFT_EAR, KP_RIGHT_EAR
@@ -163,35 +278,58 @@ class YoloDetector:
             if x > 0 and y > 0:
                 pts.append((x, y))
 
-        if len(pts) < 2:
-            return None
+        if len(pts) >= 2:
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
+            cx     = sum(xs) / len(xs)
+            cy     = sum(ys) / len(ys)
+            span_x = max(xs) - min(xs)
+            span_y = max(ys) - min(ys)
+            radius = max(span_x, span_y) * 0.9
+            radius = max(radius, 20)
 
-        xs = [p[0] for p in pts]
-        ys = [p[1] for p in pts]
-        cx     = sum(xs) / len(xs)
-        cy     = sum(ys) / len(ys)
-        span_x = max(xs) - min(xs)
-        span_y = max(ys) - min(ys)
-        radius = max(span_x, span_y) * 0.9
-        radius = max(radius, 20)
+            fx1 = max(0,       int(cx - radius * 1.4))
+            fy1 = max(0,       int(cy - radius * 1.8))  # extra top margin
+            fx2 = min(frame_w, int(cx + radius * 1.4))
+            fy2 = min(frame_h, int(cy + radius * 1.0))
+            return (fx1, fy1, fx2, fy2)
 
-        fx1 = max(0,        int(cx - radius * 1.3))
-        fy1 = max(0,        int(cy - radius * 1.6))
-        fx2 = min(frame_w,  int(cx + radius * 1.3))
-        fy2 = min(frame_h,  int(cy + radius * 1.0))
+        # ---------------------------------------------------------------
+        # FIX 6b – No visible head keypoints: extrapolate from shoulders
+        # ---------------------------------------------------------------
+        shoulder_pts = []
+        for idx in [KP_LEFT_SHLDR, KP_RIGHT_SHLDR]:
+            if idx >= len(keypoints):
+                continue
+            kp = keypoints[idx]
+            if len(kp) >= 3 and kp[2] < KP_CONF_THRESHOLD:
+                continue
+            x, y = float(kp[0]), float(kp[1])
+            if x > 0 and y > 0:
+                shoulder_pts.append((x, y))
 
-        return (fx1, fy1, fx2, fy2)
+        if shoulder_pts:
+            sx  = sum(p[0] for p in shoulder_pts) / len(shoulder_pts)
+            sy  = sum(p[1] for p in shoulder_pts) / len(shoulder_pts)
+            # Shoulder width as head-size proxy
+            if len(shoulder_pts) == 2:
+                shldr_w = abs(shoulder_pts[0][0] - shoulder_pts[1][0])
+            else:
+                shldr_w = bbox_h * 0.25 if bbox_h else 40
+            head_r = max(shldr_w * 0.55, 20)
+            # Head is roughly 1.0–1.5× head_r above the shoulders
+            head_cy = sy - head_r * 1.2
+
+            fx1 = max(0,       int(sx - head_r * 1.3))
+            fy1 = max(0,       int(head_cy - head_r * 1.2))
+            fx2 = min(frame_w, int(sx + head_r * 1.3))
+            fy2 = min(frame_h, int(head_cy + head_r * 1.0))
+            return (fx1, fy1, fx2, fy2)
+
+        return None
 
     # ======================================================
     # BUILD CONVEX HULL POLYGON FROM ALL BODY KEYPOINTS
-    #
-    # Each confident keypoint is expanded to a small disc
-    # (radius = HULL_RADIUS_RATIO * bbox_w) before the hull
-    # is computed, so the mask covers body thickness, not
-    # just the skeleton joints.
-    #
-    # Returns an (N, 1, 2) int32 array suitable for
-    # cv2.fillPoly, or None if not enough keypoints.
     # ======================================================
 
     def _body_polygon_from_keypoints(
@@ -199,14 +337,26 @@ class YoloDetector:
         keypoints,
         frame_h: int,
         frame_w: int,
-        bbox_w: int,
+        bbox: tuple,          # (x1, y1, x2, y2)
     ):
+        """
+        FIX 7 – The hull is now always padded to the FULL bounding box
+        extent so that a person whose keypoints only cover the lower half
+        (head/torso above frame) still gets a complete body mask.
+
+        Steps:
+          1. Collect confident keypoints (expanded to discs).
+          2. Add the four corners of the detection bbox as anchors.
+          3. Compute the convex hull of all those points.
+        """
+        x1, y1, x2, y2 = bbox
+        bbox_w = x2 - x1
+
         radius = max(
             int(bbox_w * HULL_RADIUS_RATIO),
             HULL_RADIUS_MIN_PX
         )
 
-        # Collect all confident, non-zero keypoints
         pts = []
 
         for kp in keypoints:
@@ -217,12 +367,23 @@ class YoloDetector:
                 continue
             pts.append((x, y))
 
+        # Ensure we have SOMETHING to build a hull from even if no
+        # keypoints are confident enough.
         if len(pts) < 3:
-            return None
+            # Fall back to bbox corners only — hull will be the rectangle.
+            pts = [
+                (x1, y1), (x2, y1),
+                (x2, y2), (x1, y2),
+            ]
+        else:
+            # Always include bbox corners so the mask is never *smaller*
+            # than the detected bounding box.
+            pts += [
+                (x1, y1), (x2, y1),
+                (x2, y2), (x1, y2),
+            ]
 
-        # Expand each point to a disc using 8 sample points on
-        # the circumference, then compute the convex hull of
-        # all those samples.
+        # Expand each point to a disc (8 samples on circumference)
         expanded = []
         angles   = np.linspace(0, 2 * np.pi, 8, endpoint=False)
 
@@ -235,7 +396,6 @@ class YoloDetector:
         pts_array = np.array(expanded, dtype=np.float32)
         hull      = cv2.convexHull(pts_array)
 
-        # cv2.convexHull returns (N,1,2); cast to int32 for fillPoly
         return hull.astype(np.int32)
 
     # ======================================================
@@ -249,6 +409,27 @@ class YoloDetector:
         return "child" if aspect < CHILD_ASPECT_RATIO_MAX else "adult"
 
     # ======================================================
+    # MULTI-SCALE DETECTION PASS
+    # ======================================================
+
+    def _run_inference(self, frame: np.ndarray, imgsz: int):
+        """
+        Run a single YOLO track/predict pass and return the results list.
+        Uses track() so ByteTrack IDs are maintained across calls.
+        """
+        return self.model.track(
+            frame,
+            persist=True,
+            tracker="bytetrack.yaml",
+            imgsz=imgsz,
+            conf=self.conf_threshold,
+            half=self.use_half,
+            iou=0.4,
+            verbose=False,
+            classes=[0],   # person only — avoids processing irrelevant classes
+        )
+
+    # ======================================================
     # DETECTION
     # ======================================================
 
@@ -260,7 +441,8 @@ class YoloDetector:
         self._frame_counter += 1
 
         # --------------------------------------------------
-        # FRAME SKIP
+        # FRAME SKIP  (kept for performance; default = 1
+        # meaning every frame is a detection frame)
         # --------------------------------------------------
 
         if self._frame_counter % self.frame_skip != 0:
@@ -292,29 +474,46 @@ class YoloDetector:
             return active_boxes
 
         # --------------------------------------------------
-        # FULL DETECTION FRAME
+        # PREPROCESSING
         # --------------------------------------------------
+
+        # FIX 8 – CLAHE contrast enhancement before inference.
+        # Helps detect persons in shadows, backlit scenes, or dull backgrounds.
+        proc_frame = _preprocess_frame(frame)
+
+        # FIX 9 – Upscale very small frames so small persons get more pixels.
+        proc_frame, up_scale = _upscale_small_frame(proc_frame)
 
         original_h, original_w = frame.shape[:2]
         active_boxes = []
 
         try:
 
-            results = self.model.track(
-                frame,
-                persist=True,
-                tracker="bytetrack.yaml",
-                imgsz=self.imgsz,
-                conf=self.conf_threshold,
-                half=self.use_half,
-                iou=0.4,
-                verbose=False
-            )
+            # ------------------------------------------------------
+            # MULTI-SCALE INFERENCE
+            # FIX 10 – Run at two resolutions and merge with NMS.
+            # Primary pass (large imgsz) = fine detail for large persons.
+            # Secondary pass (small imgsz) = global context for crowd/BG.
+            # ------------------------------------------------------
+
+            results_primary   = self._run_inference(proc_frame, IMGSZ_PRIMARY)
+            results_secondary = self._run_inference(proc_frame, IMGSZ_SECONDARY)
+
+            # Combine into one list, secondary first so primary IDs win NMS.
+            all_results = list(results_secondary) + list(results_primary)
+
+            # Track all seen track IDs this frame so we can mark missing
+            seen_ids = set()
 
             for data in self.tracked_objects.values():
                 data["missing"] += 1
 
-            for result in results:
+            # Collect raw detections for NMS-based dedup across passes
+            raw_boxes   = []   # (x1,y1,x2,y2) in ORIGINAL frame coords
+            raw_scores  = []
+            raw_meta    = []   # (track_id, i, result_idx) for keypoint lookup
+
+            for r_idx, result in enumerate(all_results):
 
                 if result.boxes is None:
                     continue
@@ -338,108 +537,144 @@ class YoloDetector:
                     track_id = int(box.id[0])
 
                     x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+
+                    # Scale back to original frame if we upscaled
+                    if up_scale != 1.0:
+                        x1 /= up_scale; y1 /= up_scale
+                        x2 /= up_scale; y2 /= up_scale
+
                     x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
 
-                    padding_x = int((x2 - x1) * 0.06)
-                    padding_y = int((y2 - y1) * 0.06)
+                    raw_boxes.append((x1, y1, x2, y2))
+                    raw_scores.append(confidence)
+                    raw_meta.append((track_id, i, r_idx, result))
 
-                    x1 = max(0, x1 - padding_x)
-                    y1 = max(0, y1 - padding_y)
-                    x2 = min(original_w, x2 + padding_x)
-                    y2 = min(original_h, y2 + padding_y)
+            # Deduplicate across the two passes
+            kept_indices = _nms_boxes(raw_boxes, raw_scores, NMS_IOU_MERGE)
 
-                    bw = x2 - x1
-                    bh = y2 - y1
-                    cx = x1 + bw // 2
-                    cy = y1 + bh // 2
+            for idx in kept_indices:
 
-                    age = self._classify_age(bw, bh)
+                x1, y1, x2, y2       = raw_boxes[idx]
+                track_id, i, r_idx, result = raw_meta[idx]
 
-                    # ------------------------------------------
-                    # FACE ROI + BODY HULL FROM KEYPOINTS
-                    # ------------------------------------------
+                # Re-fetch keypoints from the correct result
+                keypoints = result.keypoints
 
-                    face_roi = None
-                    hull     = None
+                seen_ids.add(track_id)
 
-                    if keypoints is not None and i < len(keypoints.data):
+                # Reset missing counter for re-detected tracks
+                if track_id in self.tracked_objects:
+                    self.tracked_objects[track_id]["missing"] = 0
 
-                        kps = keypoints.data[i].cpu().numpy()
+                padding_x = int((x2 - x1) * 0.06)
+                padding_y = int((y2 - y1) * 0.06)
 
-                        face_roi = self._face_roi_from_keypoints(
-                            kps, original_h, original_w
-                        )
+                x1 = max(0,          x1 - padding_x)
+                y1 = max(0,          y1 - padding_y)
+                x2 = min(original_w, x2 + padding_x)
+                y2 = min(original_h, y2 + padding_y)
 
-                        hull = self._body_polygon_from_keypoints(
-                            kps, original_h, original_w, bw
-                        )
+                bw = x2 - x1
+                bh = y2 - y1
+                cx = x1 + bw // 2
+                cy = y1 + bh // 2
 
-                    # ------------------------------------------
-                    # KALMAN UPDATE OR INIT
-                    # ------------------------------------------
+                age = self._classify_age(bw, bh)
 
-                    if track_id in self.tracked_objects:
+                # ------------------------------------------
+                # FACE ROI + BODY HULL FROM KEYPOINTS
+                # ------------------------------------------
 
-                        prev      = self.tracked_objects[track_id]
-                        prev_bbox = prev["bbox"]
+                face_roi = None
+                hull     = None
 
-                        prev_cx = prev_bbox[0] + prev_bbox[2] // 2
-                        prev_cy = prev_bbox[1] + prev_bbox[3] // 2
+                if keypoints is not None and i < len(keypoints.data):
 
-                        alpha = 0.4
+                    kps = keypoints.data[i].cpu().numpy()
 
-                        smooth_cx = int(prev_cx * alpha + cx * (1 - alpha))
-                        smooth_cy = int(prev_cy * alpha + cy * (1 - alpha))
-                        smooth_bw = int(prev_bbox[2] * alpha + bw * (1 - alpha))
-                        smooth_bh = int(prev_bbox[3] * alpha + bh * (1 - alpha))
+                    face_roi = self._face_roi_from_keypoints(
+                        kps, original_h, original_w, bbox_h=bh
+                    )
 
-                        orig_w, orig_h = prev["original_size"]
+                    hull = self._body_polygon_from_keypoints(
+                        kps, original_h, original_w,
+                        bbox=(x1, y1, x2, y2),
+                    )
+                else:
+                    # FIX 11 – No keypoints at all: still build a full-bbox
+                    # hull so the person is masked.
+                    dummy_kps = []
+                    hull = self._body_polygon_from_keypoints(
+                        dummy_kps, original_h, original_w,
+                        bbox=(x1, y1, x2, y2),
+                    )
 
-                        max_w = int(orig_w * self.max_size_multiplier)
-                        max_h = int(orig_h * self.max_size_multiplier)
-                        min_w = int(orig_w / self.max_size_multiplier)
-                        min_h = int(orig_h / self.max_size_multiplier)
+                # ------------------------------------------
+                # KALMAN UPDATE OR INIT
+                # ------------------------------------------
 
-                        smooth_bw = max(min_w, min(smooth_bw, max_w))
-                        smooth_bh = max(min_h, min(smooth_bh, max_h))
+                if track_id in self.tracked_objects:
 
-                        new_orig_w = int(orig_w * 0.95 + bw * 0.05)
-                        new_orig_h = int(orig_h * 0.95 + bh * 0.05)
+                    prev      = self.tracked_objects[track_id]
+                    prev_bbox = prev["bbox"]
 
-                        measurement = np.array(
-                            [[smooth_cx], [smooth_cy], [smooth_bw], [smooth_bh]],
-                            dtype=np.float32
-                        )
+                    prev_cx = prev_bbox[0] + prev_bbox[2] // 2
+                    prev_cy = prev_bbox[1] + prev_bbox[3] // 2
 
-                        prev["kf"].correct(measurement)
+                    alpha = 0.4
 
-                        kf            = prev["kf"]
-                        original_size = (new_orig_w, new_orig_h)
+                    smooth_cx = int(prev_cx * alpha + cx * (1 - alpha))
+                    smooth_cy = int(prev_cy * alpha + cy * (1 - alpha))
+                    smooth_bw = int(prev_bbox[2] * alpha + bw * (1 - alpha))
+                    smooth_bh = int(prev_bbox[3] * alpha + bh * (1 - alpha))
 
-                        smooth_box = (
-                            smooth_cx - smooth_bw // 2,
-                            smooth_cy - smooth_bh // 2,
-                            smooth_bw,
-                            smooth_bh
-                        )
+                    orig_w, orig_h = prev["original_size"]
 
-                    else:
+                    max_w = int(orig_w * self.max_size_multiplier)
+                    max_h = int(orig_h * self.max_size_multiplier)
+                    min_w = int(orig_w / self.max_size_multiplier)
+                    min_h = int(orig_h / self.max_size_multiplier)
 
-                        kf = self._create_kalman_filter(
-                            float(cx), float(cy), float(bw), float(bh)
-                        )
-                        smooth_box    = (x1, y1, bw, bh)
-                        original_size = (bw, bh)
+                    smooth_bw = max(min_w, min(smooth_bw, max_w))
+                    smooth_bh = max(min_h, min(smooth_bh, max_h))
 
-                    self.tracked_objects[track_id] = {
-                        "bbox":          smooth_box,
-                        "face_roi":      face_roi,
-                        "hull":          hull,
-                        "age":           age,
-                        "missing":       0,
-                        "kf":            kf,
-                        "original_size": original_size,
-                    }
+                    new_orig_w = int(orig_w * 0.95 + bw * 0.05)
+                    new_orig_h = int(orig_h * 0.95 + bh * 0.05)
+
+                    measurement = np.array(
+                        [[smooth_cx], [smooth_cy], [smooth_bw], [smooth_bh]],
+                        dtype=np.float32
+                    )
+
+                    prev["kf"].correct(measurement)
+
+                    kf            = prev["kf"]
+                    original_size = (new_orig_w, new_orig_h)
+
+                    smooth_box = (
+                        smooth_cx - smooth_bw // 2,
+                        smooth_cy - smooth_bh // 2,
+                        smooth_bw,
+                        smooth_bh
+                    )
+
+                else:
+
+                    kf = self._create_kalman_filter(
+                        float(cx), float(cy), float(bw), float(bh)
+                    )
+                    smooth_box    = (x1, y1, bw, bh)
+                    original_size = (bw, bh)
+
+                self.tracked_objects[track_id] = {
+                    "bbox":          smooth_box,
+                    "face_roi":      face_roi,
+                    "hull":          hull,
+                    "age":           age,
+                    "missing":       0,
+                    "kf":            kf,
+                    "original_size": original_size,
+                }
 
             # Collect active + purge expired
             expired_ids = []
@@ -521,8 +756,8 @@ def _mask_object(
     w = max(1, w);  h = max(1, h)
 
     # ======================================================
-    # FACE MODE  —  unchanged: keypoint-derived ROI or
-    # ratio-based fallback, always a rectangle
+    # FACE MODE  —  keypoint-derived ROI (with shoulder
+    # extrapolation fallback) or ratio-based last resort.
     # ======================================================
 
     if mode == "face":
@@ -542,8 +777,8 @@ def _mask_object(
         frame = _fill_rect(frame, fx1, fy1, fx2, fy2, color)
 
     # ======================================================
-    # BODY MODE  —  convex hull when available,
-    # tight bbox fallback when not
+    # BODY MODE  —  convex hull (now always present because
+    # _body_polygon_from_keypoints falls back to the bbox).
     # ======================================================
 
     elif mode == "body":
@@ -551,7 +786,7 @@ def _mask_object(
         if hull is not None:
             frame = _fill_polygon(frame, hull, color)
         else:
-            # Fallback: use the body bbox directly (already tight)
+            # Ultimate safety net — should rarely be reached.
             frame = _fill_rect(frame, x, y, x + w, y + h, color)
 
     return frame
