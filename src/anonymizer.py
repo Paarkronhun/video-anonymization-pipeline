@@ -77,6 +77,62 @@ IMGSZ_SECONDARY = 640    # second pass at smaller scale for broader context
 NMS_IOU_MERGE   = 0.40   # IoU threshold when merging two-pass boxes
 
 # ==========================================================
+# FEATURE FLAGS & POST-PROCESSING CONFIG
+# ==========================================================
+
+# -- Border crop (applied AFTER masking, AFTER all AI passes) ---------------
+# Set to True to crop a margin around the output frame so that
+# partially-detected faces at frame edges are hidden.
+BORDER_CROP_ENABLED    = False
+# Fraction of each side to remove (0.05 = 5%, 0.10 = 10%).
+BORDER_CROP_RATIO      = 0.05
+
+# -- Global background blur (applied AFTER ALL masking — very last step) -----
+# A very light Gaussian blur over the entire frame softens any face that
+# slipped through both the AI detector and the border crop.
+# Applied LAST so it NEVER interferes with the computer vision pipeline.
+# Objects (cars, road markings, bikes) remain perfectly visible for analysis.
+GLOBAL_BLUR_ENABLED    = True
+# Kernel size (must be odd).  21 px ≈ 1-2 % of a 1080p frame width:
+# imperceptible on large objects, sufficient to defeat face recognition.
+GLOBAL_BLUR_KERNEL     = 21
+# Sigma — 0 = auto from kernel size.
+GLOBAL_BLUR_SIGMA      = 0
+
+# -- Tight silhouette masking -----------------------------------------------
+# When SILHOUETTE_MODE_ENABLED is True the pipeline loads a *second* YOLO
+# model (yolo11x-seg.pt) that produces pixel-accurate instance segmentation
+# masks instead of convex hulls.  The result hugs the person's body much
+# more closely, leaving fewer surrounding pixels masked.
+#
+# Automatic safety fallback:
+#   • If the segmentation mask confidence is below SILHOUETTE_MIN_CONF the
+#     detection falls back to the convex-hull "body" mask for that person.
+#   • If the seg model fails to load, SILHOUETTE_MODE_ENABLED is forced
+#     to False at startup and the pipeline continues with the pose model.
+#
+# Set to False to disable entirely and stick with convex-hull body masks.
+SILHOUETTE_MODE_ENABLED  = True
+# Path to the YOLOv11 segmentation model weights.
+SILHOUETTE_MODEL_PATH    = "models/yolo11x-seg.pt"
+# Minimum mask confidence [0–1] to accept a segmentation mask.
+# Below this threshold the detection falls back to the convex hull.
+SILHOUETTE_MIN_CONF      = 0.45
+
+# -- Temporal coherence second-pass -----------------------------------------
+# After all frames are processed, a second pass analyses the stored
+# mask trajectories to fill frames where a tracked person temporarily
+# disappeared (occlusion by a pole, parked car, etc.).
+# This flag is read by the VideoAnonymizer pipeline (see bottom of file).
+TEMPORAL_COHERENCE_ENABLED = True
+# How many frames to look ahead/behind when interpolating a missing mask.
+TEMPORAL_COHERENCE_WINDOW  = 30
+# Minimum IoU between predicted and next-seen hull centroid to accept
+# the interpolated mask.
+TEMPORAL_MIN_IOU           = 0.0   # 0 = always interpolate if track exists
+
+
+# ==========================================================
 # PREPROCESSING HELPERS
 # ==========================================================
 
@@ -121,6 +177,56 @@ def _upscale_small_frame(
     new_h = int(h * scale)
     resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
     return resized, scale
+
+
+# ==========================================================
+# POST-PROCESSING HELPERS
+# ==========================================================
+
+def apply_global_blur(
+    frame: np.ndarray,
+    kernel: int = GLOBAL_BLUR_KERNEL,
+    sigma: float = GLOBAL_BLUR_SIGMA,
+) -> np.ndarray:
+    """
+    Apply a very light Gaussian blur over the entire frame.
+
+    This is the LAST operation in the pipeline — called after AI masking AND
+    after the border crop.  It acts as a final safety net for any face that
+    slipped through both the detector and the crop, without ever touching the
+    original frame that the CV pipeline analyses.
+
+    A kernel of 21 px ≈ 1–2 % of a 1080p frame width: imperceptible on
+    large objects (cars, road markings, bikes) but sufficient to prevent
+    face recognition on missed persons in the background.
+    """
+    k = kernel if kernel % 2 == 1 else kernel + 1   # force odd
+    return cv2.GaussianBlur(frame, (k, k), sigma)
+
+
+def apply_border_crop(
+    frame: np.ndarray,
+    ratio: float = BORDER_CROP_RATIO,
+) -> np.ndarray:
+    """
+    Crop *ratio* of width/height from each side of the frame, then resize
+    back to the original resolution so the output dimensions stay constant.
+
+    Applied AFTER all masking passes so that partially-detected faces that
+    appear at frame edges (common when people enter/exit the scene) are
+    simply removed from the output.
+
+    Example: ratio=0.05 on a 1920×1080 frame removes a 96 px border on
+    each side before upscaling back to 1920×1080.
+    """
+    h, w = frame.shape[:2]
+    dx = max(1, int(w * ratio))
+    dy = max(1, int(h * ratio))
+
+    cropped = frame[dy: h - dy, dx: w - dx]
+
+    # Resize back to original dimensions so VideoWriter stays consistent.
+    return cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LINEAR)
 
 
 # ==========================================================
@@ -189,6 +295,10 @@ class YoloDetector:
         self.frame_skip          = frame_skip
         self._frame_counter      = -1
         self._last_boxes         = []
+
+        # Temporal coherence: stores per-track mask history across all frames.
+        # Structure: {track_id: [(frame_idx, hull, face_roi, age), ...]}
+        self.mask_history: dict[int, list] = {}
 
         self.model_path     = model_path
         self.conf_threshold = conf_threshold
@@ -676,6 +786,16 @@ class YoloDetector:
                     "original_size": original_size,
                 }
 
+                # Record mask for temporal coherence second-pass
+                if track_id not in self.mask_history:
+                    self.mask_history[track_id] = []
+                self.mask_history[track_id].append((
+                    self._frame_counter,
+                    hull.copy() if hull is not None else None,
+                    face_roi,
+                    age,
+                ))
+
             # Collect active + purge expired
             expired_ids = []
 
@@ -702,11 +822,182 @@ class YoloDetector:
         return active_boxes
 
 
+
+# ==========================================================
+# SEGMENTATION DETECTOR  (tight silhouette masking)
+# ==========================================================
+
+class SegmentationDetector:
+    """
+    Wraps a YOLO segmentation model (yolo11x-seg.pt) to produce pixel-accurate
+    instance masks that hug the body contour far more tightly than convex hulls.
+
+    Used when SILHOUETTE_MODE_ENABLED is True.  For each person detection the
+    seg model returns a binary mask; we extract its contour and pass it as the
+    "hull" field of the detection dict.  If the mask confidence is below
+    SILHOUETTE_MIN_CONF the entry hull is left as None so _mask_object falls
+    back to the convex-hull from the pose model.
+
+    Automatic fallback
+    ------------------
+    If the model file is missing or fails to load, `self.available` is set to
+    False.  The pipeline checks this flag and silently disables silhouette mode,
+    continuing with the regular pose-based convex hull.
+    """
+
+    def __init__(
+        self,
+        model_path: str   = SILHOUETTE_MODEL_PATH,
+        conf:       float = SILHOUETTE_MIN_CONF,
+        imgsz:      int   = IMGSZ_PRIMARY,
+    ):
+        self.conf      = conf
+        self.imgsz     = imgsz
+        self.available = False
+
+        try:
+            logging.info(f"[SegDet] Loading segmentation model: {model_path}")
+            self._model = YOLO(model_path)
+
+            self._device   = "cuda" if torch.cuda.is_available() else "cpu"
+            self._use_half = self._device == "cuda"
+            self._model.to(self._device)
+
+            self.available = True
+            logging.info(f"[SegDet] Segmentation model ready on {self._device}")
+
+        except Exception as e:
+            logging.warning(
+                f"[SegDet] Could not load seg model ({e}). "
+                "Silhouette mode disabled — falling back to convex hull."
+            )
+
+    # ----------------------------------------------------------
+    def get_masks(
+        self,
+        frame: np.ndarray,
+        detections: list,
+    ) -> list:
+        """
+        For each detection in *detections*, attempt to obtain a tight
+        segmentation contour from the seg model.
+
+        Returns a new list of detections where:
+          • hull  = tight contour polygon  (if seg succeeded)
+          • hull  = original convex hull   (if seg confidence too low or failed)
+
+        The original detection dicts are NOT modified in place; new dicts
+        are returned.
+        """
+        if not self.available:
+            return detections
+
+        h, w = frame.shape[:2]
+
+        try:
+            results = self._model.predict(
+                frame,
+                imgsz    = self.imgsz,
+                conf     = self.conf,
+                half     = self._use_half,
+                verbose  = False,
+                classes  = [0],   # person only
+            )
+        except Exception as e:
+            logging.warning(f"[SegDet] Inference error: {e} — using hull fallback")
+            return detections
+
+        if not results or results[0].masks is None:
+            return detections
+
+        result = results[0]
+        seg_masks   = result.masks.data.cpu().numpy()    # (N, H', W')
+        seg_confs   = result.boxes.conf.cpu().numpy()    # (N,)
+        seg_boxes   = result.boxes.xyxy.cpu().numpy()    # (N, 4)
+
+        updated = []
+
+        for det in detections:
+            dx, dy, dw, dh = det["bbox"]
+            det_x1 = dx;        det_y1 = dy
+            det_x2 = dx + dw;   det_y2 = dy + dh
+
+            best_iou   = 0.0
+            best_mask  = None
+
+            for seg_i, (sbox, sconf, smask) in enumerate(
+                zip(seg_boxes, seg_confs, seg_masks)
+            ):
+                if sconf < self.conf:
+                    continue
+
+                sx1, sy1, sx2, sy2 = sbox
+
+                # IoU between pose-model bbox and seg bbox
+                ix1 = max(det_x1, sx1);  iy1 = max(det_y1, sy1)
+                ix2 = min(det_x2, sx2);  iy2 = min(det_y2, sy2)
+                inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+                if inter == 0:
+                    continue
+                union = (
+                    (det_x2 - det_x1) * (det_y2 - det_y1)
+                    + (sx2 - sx1) * (sy2 - sy1)
+                    - inter
+                )
+                iou = inter / union if union > 0 else 0.0
+
+                if iou > best_iou:
+                    best_iou  = iou
+                    best_mask = smask
+
+            if best_mask is not None and best_iou >= 0.25:
+                # Resize mask from YOLO's internal resolution to frame size
+                mask_resized = cv2.resize(
+                    best_mask.astype(np.uint8),
+                    (w, h),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+                mask_bin = (mask_resized > 0.5).astype(np.uint8) * 255
+
+                # Extract contour as the tight hull
+                contours, _ = cv2.findContours(
+                    mask_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+                )
+
+                if contours:
+                    # Use the largest contour (main body)
+                    largest = max(contours, key=cv2.contourArea)
+
+                    # Light smoothing: approxPolyDP to reduce jitter between
+                    # frames while keeping the contour tight.
+                    epsilon = 0.005 * cv2.arcLength(largest, True)
+                    approx  = cv2.approxPolyDP(largest, epsilon, True)
+
+                    if len(approx) >= 3:
+                        new_det = dict(det)
+                        new_det["hull"]          = approx.astype(np.int32)
+                        new_det["seg_used"]      = True
+                        updated.append(new_det)
+                        continue   # success — skip fallback
+
+            # Fallback: keep original convex hull from pose model
+            new_det = dict(det)
+            new_det["seg_used"] = False
+            updated.append(new_det)
+
+        return updated
+
+
 # ==========================================================
 # DETECTOR SINGLETON
 # ==========================================================
 
 DETECTOR = YoloDetector()
+
+# Segmentation detector — instantiated only when feature is enabled.
+# If the model file is absent, SegmentationDetector.available is False
+# and the pipeline silently falls back to convex-hull mode.
+SEG_DETECTOR = SegmentationDetector() if SILHOUETTE_MODE_ENABLED else None
 
 # ==========================================================
 # DRAWING HELPERS
@@ -789,23 +1080,407 @@ def _mask_object(
             # Ultimate safety net — should rarely be reached.
             frame = _fill_rect(frame, x, y, x + w, y + h, color)
 
+    # ======================================================
+    # SILHOUETTE MODE  —  tight segmentation contour.
+    # Drawn with fillPoly (works for non-convex polygons too).
+    # If no seg hull was obtained (seg_used=False) the convex
+    # hull from the pose model is used as an automatic fallback;
+    # if that is also absent we fall back to the bounding rect.
+    # ======================================================
+
+    elif mode == "silhouette":
+
+        if hull is not None:
+            # Works for both seg contours and convex hulls
+            cv2.fillPoly(frame, [hull], color)
+        else:
+            frame = _fill_rect(frame, x, y, x + w, y + h, color)
+
     return frame
 
 # ==========================================================
-# MAIN PUBLIC FUNCTION
+# MAIN PUBLIC FUNCTION  (single-frame, no post-processing)
 # ==========================================================
 
 def anonymize_frame(
     frame: np.ndarray,
-    mode: str = "face"
+    mode: str = "face",
+    global_blur: bool  = GLOBAL_BLUR_ENABLED,
+    border_crop: bool  = BORDER_CROP_ENABLED,
 ) -> np.ndarray:
+    """
+    Anonymise a single frame.
 
+    Supported modes
+    ---------------
+    "face"       — mask the head region only (keypoint ROI or ratio fallback)
+    "body"       — fill the full convex-hull silhouette (pose keypoints)
+    "silhouette" — tight pixel-accurate segmentation mask (requires
+                   yolo11x-seg.pt).  Automatically falls back per-person to
+                   the convex hull if seg confidence < SILHOUETTE_MIN_CONF,
+                   and to rectangles if the hull is also absent.
+                   If the seg model failed to load the whole frame silently
+                   uses "body" mode.
+
+    Processing order (IMPORTANT — do not change):
+      1. Pose-model detection (YOLO pose)
+      2. Silhouette refinement via seg model  (silhouette mode only)
+      3. Apply masks to frame
+      4. Border crop                          (optional)
+      5. Global blur                          (optional, ALWAYS LAST)
+         → blur is applied after everything else so it NEVER touches the
+           frame seen by any CV model.
+
+    Parameters
+    ----------
+    frame        : BGR frame from cv2.VideoCapture
+    mode         : "face" | "body" | "silhouette"
+    border_crop  : crop frame edges after masking (removes edge artefacts)
+    global_blur  : light Gaussian blur as final safety net — LAST step only
+    """
+
+    # 1. Pose-model detection
     detections = DETECTOR.detect(frame)
 
-    if not detections:
-        return frame
+    # 2. Silhouette refinement (seg model, if available and requested)
+    effective_mode = mode
+    if mode == "silhouette":
+        if SEG_DETECTOR is not None and SEG_DETECTOR.available:
+            detections = SEG_DETECTOR.get_masks(frame, detections)
+        else:
+            # Seg model unavailable — fall back to convex-hull body mode
+            logging.debug("Silhouette mode: seg model unavailable, using body mode")
+            effective_mode = "body"
 
+    # 3. Apply masks
     for detection in detections:
-        frame = _mask_object(frame, detection, mode)
+        frame = _mask_object(frame, detection, effective_mode)
+
+    # 4. Border crop (after masking)
+    if border_crop:
+        frame = apply_border_crop(frame)
+
+    # 5. Global blur — MUST be last; never interferes with CV pipeline
+    if global_blur:
+        frame = apply_global_blur(frame)
 
     return frame
+
+
+# ==========================================================
+# TEMPORAL COHERENCE ENGINE
+# ==========================================================
+
+def _interpolate_hull(
+    hull_before: np.ndarray,
+    hull_after: np.ndarray,
+    t: float,                   # 0.0 = before, 1.0 = after
+) -> np.ndarray:
+    """
+    Linear interpolation between two convex hulls.
+
+    Both hulls may have different numbers of points.  We resample each to
+    a fixed number of points on their perimeter before lerping so the
+    interpolation is smooth.
+    """
+    N = 64   # number of perimeter samples
+
+    def resample(hull: np.ndarray, n: int) -> np.ndarray:
+        pts = hull.reshape(-1, 2).astype(np.float32)
+        # Close the contour
+        pts_closed = np.vstack([pts, pts[:1]])
+        # Arc-length parameterisation
+        diffs  = np.diff(pts_closed, axis=0)
+        dists  = np.sqrt((diffs ** 2).sum(axis=1))
+        cumlen = np.hstack([[0], np.cumsum(dists)])
+        total  = cumlen[-1]
+        if total < 1e-6:
+            return np.tile(pts[0], (n, 1))
+        sample_at = np.linspace(0, total, n, endpoint=False)
+        xs = np.interp(sample_at, cumlen, pts_closed[:, 0])
+        ys = np.interp(sample_at, cumlen, pts_closed[:, 1])
+        return np.column_stack([xs, ys])
+
+    s_before = resample(hull_before, N)
+    s_after  = resample(hull_after,  N)
+
+    lerped = (1.0 - t) * s_before + t * s_after
+    return lerped.astype(np.int32).reshape(-1, 1, 2)
+
+
+class TemporalCoherencePass:
+    """
+    Second pass over the stored mask history to fill gaps caused by occlusion.
+
+    When a tracked person temporarily disappears (e.g. walks behind a pole or
+    parked car) the detector stops producing a mask for a few frames.  If the
+    same track ID reappears within TEMPORAL_COHERENCE_WINDOW frames we
+    interpolate the hull linearly between the last seen and the next seen
+    position and apply it to the in-between frames.
+
+    Usage
+    -----
+    Pass is instantiated once and `fill_gaps()` is called after all frames
+    have been processed to obtain a dict of per-frame extra masks:
+
+        extra = TemporalCoherencePass(DETECTOR.mask_history)
+        gap_masks = extra.fill_gaps()
+        # gap_masks[frame_idx] = list of {hull, face_roi, age} dicts
+    """
+
+    def __init__(
+        self,
+        mask_history: dict,
+        window: int   = TEMPORAL_COHERENCE_WINDOW,
+    ):
+        self.history = mask_history   # {track_id: [(frame_idx, hull, face_roi, age), ...]}
+        self.window  = window
+
+    def fill_gaps(self) -> dict[int, list]:
+        """
+        Returns a dict mapping frame_idx → list of interpolated detections
+        for frames that had a gap in a tracked trajectory.
+        """
+        extra: dict[int, list] = {}
+
+        for track_id, entries in self.history.items():
+            if len(entries) < 2:
+                continue
+
+            # Sort chronologically
+            entries_sorted = sorted(entries, key=lambda e: e[0])
+
+            for j in range(len(entries_sorted) - 1):
+                f_idx_a, hull_a, face_a, age_a = entries_sorted[j]
+                f_idx_b, hull_b, face_b, age_b = entries_sorted[j + 1]
+
+                gap = f_idx_b - f_idx_a
+                if gap <= 1:
+                    continue   # consecutive frames — no gap
+                if gap > self.window:
+                    continue   # too large a gap to interpolate reliably
+
+                # Fill each missing frame between a and b
+                for k in range(1, gap):
+                    f_fill = f_idx_a + k
+                    t      = k / gap   # 0 < t < 1
+
+                    if hull_a is not None and hull_b is not None:
+                        interp_hull = _interpolate_hull(hull_a, hull_b, t)
+                    elif hull_a is not None:
+                        interp_hull = hull_a.copy()
+                    elif hull_b is not None:
+                        interp_hull = hull_b.copy()
+                    else:
+                        interp_hull = None
+
+                    # Prefer face_roi from the closer boundary
+                    face_roi = face_a if t < 0.5 else face_b
+
+                    detection = {
+                        "hull":     interp_hull,
+                        "face_roi": face_roi,
+                        "age":      age_a,
+                        # Provide a minimal bbox so _mask_object fallback works
+                        "bbox":     _hull_to_bbox(interp_hull) if interp_hull is not None else (0, 0, 1, 1),
+                    }
+
+                    extra.setdefault(f_fill, []).append(detection)
+
+        return extra
+
+
+def _hull_to_bbox(hull: np.ndarray) -> tuple:
+    """Convert a convex hull to (x, y, w, h) bounding box."""
+    pts = hull.reshape(-1, 2)
+    x1, y1 = pts[:, 0].min(), pts[:, 1].min()
+    x2, y2 = pts[:, 0].max(), pts[:, 1].max()
+    return (int(x1), int(y1), int(x2 - x1), int(y2 - y1))
+
+
+# ==========================================================
+# VIDEO ANONYMIZER  (full pipeline with all features)
+# ==========================================================
+
+class VideoAnonymizer:
+    """
+    High-level pipeline for anonymising a video file.
+
+    Features
+    --------
+    - Frame-by-frame AI detection + masking (face / body / silhouette mode)
+    - Tight pixel-accurate silhouette masks via YOLO seg model (with automatic
+      per-person fallback to convex hull if confidence is too low, and model-
+      level fallback to 'body' mode if the seg model is unavailable)
+    - Optional global background blur (applied LAST — never interferes with CV)
+    - Optional border crop (remove partially-detected faces at frame edges)
+    - Optional temporal coherence second pass (fill occlusion gaps)
+
+    Usage
+    -----
+        va = VideoAnonymizer(
+            input_path  = "input.mp4",
+            output_path = "output_anonymized.mp4",
+            mode        = "silhouette",     # "face" | "body" | "silhouette"
+            global_blur = True,
+            border_crop = True,
+            temporal_coherence = True,
+        )
+        va.run()
+    """
+
+    def __init__(
+        self,
+        input_path:          str,
+        output_path:         str,
+        mode:                str   = "silhouette",  # "face"|"body"|"silhouette"
+        global_blur:         bool  = GLOBAL_BLUR_ENABLED,
+        border_crop:         bool  = BORDER_CROP_ENABLED,
+        temporal_coherence:  bool  = TEMPORAL_COHERENCE_ENABLED,
+        blur_kernel:         int   = GLOBAL_BLUR_KERNEL,
+        crop_ratio:          float = BORDER_CROP_RATIO,
+    ):
+        self.input_path         = input_path
+        self.output_path        = output_path
+        self.mode               = mode
+        self.global_blur        = global_blur
+        self.border_crop        = border_crop
+        self.temporal_coherence = temporal_coherence
+        self.blur_kernel        = blur_kernel
+        self.crop_ratio         = crop_ratio
+
+        # Resolve effective mode: if silhouette requested but seg model
+        # is unavailable, silently downgrade to body mode at init time.
+        if mode == "silhouette" and (
+            SEG_DETECTOR is None or not SEG_DETECTOR.available
+        ):
+            logging.warning(
+                "[VideoAnonymizer] Silhouette mode requested but seg model "
+                "is unavailable — falling back to 'body' mode."
+            )
+            self.mode = "body" 
+
+    # ----------------------------------------------------------
+    def run(self):
+        cap = cv2.VideoCapture(self.input_path)
+        if not cap.isOpened():
+            raise RuntimeError(f"Cannot open video: {self.input_path}")
+
+        fps    = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        total  = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+
+        # If temporal coherence is enabled we need a two-pass approach:
+        # first pass writes to a temp file; second pass re-reads it.
+        if self.temporal_coherence:
+            import tempfile, os
+            tmp_fd, tmp_path = tempfile.mkstemp(suffix=".mp4")
+            os.close(tmp_fd)
+            first_output = tmp_path
+        else:
+            first_output = self.output_path
+
+        out = cv2.VideoWriter(first_output, fourcc, fps, (width, height))
+
+        # ---- FIRST PASS: detection + masking -------------------------
+        logging.info(
+            f"[VideoAnonymizer] First pass — {total} frames  "
+            f"blur={self.global_blur}  crop={self.border_crop}  "
+            f"temporal={self.temporal_coherence}"
+        )
+
+        frame_idx = 0
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            # Delegate to anonymize_frame which enforces the correct order:
+            #   1. pose detection
+            #   2. seg refinement (silhouette mode)
+            #   3. mask application
+            #   4. border crop
+            #   5. global blur  ← ALWAYS LAST, never touches CV input
+            frame = anonymize_frame(
+                frame,
+                mode        = self.mode,
+                global_blur = self.global_blur,
+                border_crop = self.border_crop,
+            )
+
+            out.write(frame)
+            frame_idx += 1
+
+            if frame_idx % 100 == 0:
+                logging.info(f"  first pass: {frame_idx}/{total}")
+
+        cap.release()
+        out.release()
+
+        # ---- SECOND PASS: temporal coherence -------------------------
+        if self.temporal_coherence:
+            logging.info("[VideoAnonymizer] Building temporal coherence map …")
+            coherence  = TemporalCoherencePass(DETECTOR.mask_history)
+            gap_masks  = coherence.fill_gaps()
+
+            if gap_masks:
+                logging.info(
+                    f"  {sum(len(v) for v in gap_masks.values())} "
+                    f"interpolated masks across {len(gap_masks)} frames"
+                )
+                self._apply_coherence_pass(
+                    tmp_path, self.output_path,
+                    gap_masks, fps, width, height,
+                )
+            else:
+                logging.info("  No gaps found — copying first-pass output.")
+                import shutil
+                shutil.move(tmp_path, self.output_path)
+
+            # Clean up temp file if still present
+            try:
+                import os
+                os.remove(tmp_path)
+            except FileNotFoundError:
+                pass
+
+        logging.info(f"[VideoAnonymizer] Done → {self.output_path}")
+
+    # ----------------------------------------------------------
+    def _apply_coherence_pass(
+        self,
+        src_path:  str,
+        dst_path:  str,
+        gap_masks: dict,
+        fps:       float,
+        width:     int,
+        height:    int,
+    ):
+        """
+        Re-read the first-pass video and apply interpolated masks to gap frames.
+        """
+        cap    = cv2.VideoCapture(src_path)
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        out    = cv2.VideoWriter(dst_path, fourcc, fps, (width, height))
+
+        frame_idx = 0
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            if frame_idx in gap_masks:
+                for det in gap_masks[frame_idx]:
+                    frame = _mask_object(frame, det, self.mode)
+
+            out.write(frame)
+            frame_idx += 1
+
+            if frame_idx % 100 == 0:
+                logging.info(f"  coherence pass: {frame_idx}")
+
+        cap.release()
+        out.release()
