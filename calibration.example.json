@@ -1,5 +1,9 @@
 {
-  "_comment": "Ground-plane calibration for PET/speed analysis. Replace the example values below with your own. image_points are pixel coordinates (x, y) from a representative frame of YOUR video, picked at points whose REAL-WORLD distance apart you know (e.g. lane-line spacing, crosswalk stripe width, distance between two visible landmarks measured from satellite imagery or a tape measure on site). world_points are the matching real-world coordinates in METERS for those same points, using any consistent local origin/axes (e.g. (0,0) at one corner of the intersection, x = east, y = north). Order matters: image_points[i] and world_points[i] must refer to the SAME physical point. Provide at least 4 pairs; more (5-8) improves accuracy if you can measure them.",
+  "_comment": "Ground-plane calibration for PET/speed analysis. Replace the example values below with your own. image_points are pixel coordinates (x, y) from a representative frame of 
+ YOUR video, picked at points whose REAL-WORLD distance apart you know (e.g. lane-line spacing, crosswalk stripe width, distance between two visible landmarks measured from satellite 
+ imagery or a tape measure on site). world_points are the matching real-world coordinates in METERS for those same points, using any consistent local origin/axes (e.g. (0,0) 
+ at one corner of the intersection, x = east, y = north). Order matters: image_points[i] and world_points[i] must refer to the SAME physical point. Provide at least 4 pairs; 
+ more (5-8) improves accuracy if you can measure them.",
 
   "image_points": [
     [120, 800],
