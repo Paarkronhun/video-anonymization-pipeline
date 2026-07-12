@@ -5,19 +5,13 @@ import torch
 
 from ultralytics import YOLO
 
-# ==========================================================
-# LOGGING
-# ==========================================================
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-# ==========================================================
-# POSE KEYPOINT INDICES (COCO format)
-# ==========================================================
-
+# COCO keypoint indices, this is just the standard order ultralytics
+# pose models spit out (nose, eyes, ears, shoulders, ...)
 KP_NOSE        = 0
 KP_LEFT_EYE    = 1
 KP_RIGHT_EYE   = 2
@@ -36,17 +30,11 @@ KP_RIGHT_KNEE  = 14
 KP_LEFT_ANKLE  = 15
 KP_RIGHT_ANKLE = 16
 
-# ==========================================================
-# COLOR CONSTANTS  (BGR)
-# ==========================================================
-
+# mask colors
 COLOR_ADULT = (0,   0,   0)    # Black  — adult
 COLOR_CHILD = (255, 255, 255)  # White  — child
 
-# ---------------------------------------------------------------------------
-# FIX 1 – KP confidence threshold lowered so partially visible keypoints
-# (e.g. a head cut off at the top of frame) still contribute to the hull.
-# ---------------------------------------------------------------------------
+# minimum confidence for a keypoint before we trust it.
 KP_CONF_THRESHOLD = 0.15   # was 0.3
 
 # Radius (in pixels) added around each keypoint before computing
@@ -59,67 +47,33 @@ HULL_RADIUS_RATIO = 0.18   # was 0.12 — wider expansion for partial bodies
 # a reasonable hull expansion.
 HULL_RADIUS_MIN_PX = 8    # was 6
 
-# CHILD_ASPECT_RATIO_MAX  —  w/h below this → child
+# below this width/height ratio we guess "child" instead of "adult".
+# doesn work yet
 CHILD_ASPECT_RATIO_MAX = 0.15
 
-# ---------------------------------------------------------------------------
-# FIX 2 – Preprocessing parameters
-# ---------------------------------------------------------------------------
+# Preprocessing parameters
 CLAHE_CLIP_LIMIT   = 2.0   # contrast enhancement strength
 CLAHE_TILE_GRID    = (8, 8)
 
-# ---------------------------------------------------------------------------
-# FIX 3 – Multi-scale detection: run inference at two resolutions and merge.
+
+# Multi-scale detection: run inference at two resolutions and merge.
 # Catches both large nearby persons AND small distant ones.
-# ---------------------------------------------------------------------------
 IMGSZ_PRIMARY   = 1280   # main pass  (same as before)
 IMGSZ_SECONDARY = 640    # second pass at smaller scale for broader context
 NMS_IOU_MERGE   = 0.40   # IoU threshold when merging two-pass boxes
 
-# ==========================================================
-# FEATURE FLAGS & POST-PROCESSING CONFIG
-# ==========================================================
+# crops a small margin off each edge after masking, in case a half-visible
+# face at the frame border slipped past detection. off by default since it
+# eats into the frame a bit.
+BORDER_CROP_ENABLED = False
+BORDER_CROP_RATIO = 0.05
 
-# -- Border crop (applied AFTER masking, AFTER all AI passes) ---------------
-# Set to True to crop a margin around the output frame so that
-# partially-detected faces at frame edges are hidden.
-BORDER_CROP_ENABLED    = False
-# Fraction of each side to remove (0.05 = 5%, 0.10 = 10%).
-BORDER_CROP_RATIO      = 0.05
+# extra safety net: blur the WHOLE frame very lightly at the very end.
+# only kicks in after masking so it never affects what YOLO sees.
+GLOBAL_BLUR_ENABLED = False
+GLOBAL_BLUR_KERNEL = 21   # must stay odd
+GLOBAL_BLUR_SIGMA = 0     # 0 = let opencv figure it out from kernel size
 
-# -- Global background blur (applied AFTER ALL masking — very last step) -----
-# A very light Gaussian blur over the entire frame softens any face that
-# slipped through both the AI detector and the border crop.
-# Applied LAST so it NEVER interferes with the computer vision pipeline.
-# Objects (cars, road markings, bikes) remain perfectly visible for analysis.
-GLOBAL_BLUR_ENABLED    = True
-# Kernel size (must be odd).  21 px ≈ 1-2 % of a 1080p frame width:
-# imperceptible on large objects, sufficient to defeat face recognition.
-GLOBAL_BLUR_KERNEL     = 21
-# Sigma — 0 = auto from kernel size.
-GLOBAL_BLUR_SIGMA      = 0
-
-# -- Tight silhouette masking -----------------------------------------------
-# When SILHOUETTE_MODE_ENABLED is True the pipeline loads a *second* YOLO
-# model (yolo11x-seg.pt) that produces pixel-accurate instance segmentation
-# masks instead of convex hulls.  The result hugs the person's body much
-# more closely, leaving fewer surrounding pixels masked.
-#
-# Automatic safety fallback:
-#   • If the segmentation mask confidence is below SILHOUETTE_MIN_CONF the
-#     detection falls back to the convex-hull "body" mask for that person.
-#   • If the seg model fails to load, SILHOUETTE_MODE_ENABLED is forced
-#     to False at startup and the pipeline continues with the pose model.
-#
-# Set to False to disable entirely and stick with convex-hull body masks.
-SILHOUETTE_MODE_ENABLED  = True
-# Path to the YOLOv11 segmentation model weights.
-SILHOUETTE_MODEL_PATH    = "models/yolo11x-seg.pt"
-# Minimum mask confidence [0–1] to accept a segmentation mask.
-# Below this threshold the detection falls back to the convex hull.
-SILHOUETTE_MIN_CONF      = 0.45
-
-# -- Temporal coherence second-pass -----------------------------------------
 # After all frames are processed, a second pass analyses the stored
 # mask trajectories to fill frames where a tracked person temporarily
 # disappeared (occlusion by a pole, parked car, etc.).
@@ -131,10 +85,6 @@ TEMPORAL_COHERENCE_WINDOW  = 30
 # the interpolated mask.
 TEMPORAL_MIN_IOU           = 0.0   # 0 = always interpolate if track exists
 
-
-# ==========================================================
-# PREPROCESSING HELPERS
-# ==========================================================
 
 def _preprocess_frame(frame: np.ndarray) -> np.ndarray:
     """
@@ -178,10 +128,6 @@ def _upscale_small_frame(
     resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
     return resized, scale
 
-
-# ==========================================================
-# POST-PROCESSING HELPERS
-# ==========================================================
 
 def apply_global_blur(
     frame: np.ndarray,
@@ -229,9 +175,6 @@ def apply_border_crop(
     return cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LINEAR)
 
 
-# ==========================================================
-# NMS UTILITY  (used when merging multi-scale results)
-# ==========================================================
 
 def _nms_boxes(
     boxes_xyxy: list[tuple],
@@ -270,24 +213,17 @@ def _nms_boxes(
     return keep
 
 
-# ==========================================================
-# YOLO DETECTOR
-# ==========================================================
-
 class YoloDetector:
 
     def __init__(
         self,
         model_path: str = "models/yolo11x.pt",
-        # FIX 4 – conf lowered to 0.20 so distant/occluded persons are not
+        # conf lowered to 0.20 so distant/occluded persons are not
         # silently dropped before tracking even sees them.
         conf_threshold: float = 0.20,   # was 0.35
         imgsz: int = IMGSZ_PRIMARY,
-        # FIX 5 – frame_skip set to 1 (every frame is a detection frame).
-        # Skipping frames is the single biggest source of missed anonymisation
-        # because persons visible on skipped frames only get Kalman-predicted
-        # masks that may drift off the actual body.
-        frame_skip: int = 1,            # was 2
+
+        frame_skip: int = 3,
     ):
         self.tracked_objects     = {}
         self.max_missing_frames  = 10
@@ -325,9 +261,6 @@ class YoloDetector:
             logging.exception(f"Failed to load model: {e}")
             self.initialized = False
 
-    # ======================================================
-    # KALMAN FILTER  —  8-state (pos + velocity)
-    # ======================================================
 
     def _create_kalman_filter(self, cx, cy, w, h):
 
@@ -361,16 +294,8 @@ class YoloDetector:
 
         return kf
 
-    # ======================================================
-    # EXTRACT FACE ROI FROM POSE KEYPOINTS
-    # ======================================================
 
     def _face_roi_from_keypoints(self, keypoints, frame_h, frame_w, bbox_h=None):
-        """
-        FIX 6 – When head keypoints are absent (person's head extends above
-        the frame, or is occluded), fall back to extrapolating the head
-        position from shoulder keypoints.
-        """
         head_indices = [
             KP_NOSE, KP_LEFT_EYE, KP_RIGHT_EYE,
             KP_LEFT_EAR, KP_RIGHT_EAR
@@ -404,9 +329,7 @@ class YoloDetector:
             fy2 = min(frame_h, int(cy + radius * 1.0))
             return (fx1, fy1, fx2, fy2)
 
-        # ---------------------------------------------------------------
-        # FIX 6b – No visible head keypoints: extrapolate from shoulders
-        # ---------------------------------------------------------------
+
         shoulder_pts = []
         for idx in [KP_LEFT_SHLDR, KP_RIGHT_SHLDR]:
             if idx >= len(keypoints):
@@ -438,9 +361,6 @@ class YoloDetector:
 
         return None
 
-    # ======================================================
-    # BUILD CONVEX HULL POLYGON FROM ALL BODY KEYPOINTS
-    # ======================================================
 
     def _body_polygon_from_keypoints(
         self,
@@ -450,7 +370,7 @@ class YoloDetector:
         bbox: tuple,          # (x1, y1, x2, y2)
     ):
         """
-        FIX 7 – The hull is now always padded to the FULL bounding box
+        The hull is now always padded to the FULL bounding box
         extent so that a person whose keypoints only cover the lower half
         (head/torso above frame) still gets a complete body mask.
 
@@ -508,19 +428,13 @@ class YoloDetector:
 
         return hull.astype(np.int32)
 
-    # ======================================================
-    # AGE CLASSIFICATION  —  aspect ratio heuristic
-    # ======================================================
 
     def _classify_age(self, bbox_w: int, bbox_h: int) -> str:
         if bbox_h == 0:
             return "adult"
         aspect = bbox_w / bbox_h
         return "child" if aspect < CHILD_ASPECT_RATIO_MAX else "adult"
-
-    # ======================================================
-    # MULTI-SCALE DETECTION PASS
-    # ======================================================
+    
 
     def _run_inference(self, frame: np.ndarray, imgsz: int):
         """
@@ -539,9 +453,6 @@ class YoloDetector:
             classes=[0],   # person only — avoids processing irrelevant classes
         )
 
-    # ======================================================
-    # DETECTION
-    # ======================================================
 
     def detect(self, frame: np.ndarray):
 
@@ -550,10 +461,6 @@ class YoloDetector:
 
         self._frame_counter += 1
 
-        # --------------------------------------------------
-        # FRAME SKIP  (kept for performance; default = 1
-        # meaning every frame is a detection frame)
-        # --------------------------------------------------
 
         if self._frame_counter % self.frame_skip != 0:
 
@@ -583,15 +490,11 @@ class YoloDetector:
 
             return active_boxes
 
-        # --------------------------------------------------
-        # PREPROCESSING
-        # --------------------------------------------------
-
-        # FIX 8 – CLAHE contrast enhancement before inference.
+        # CLAHE contrast enhancement before inference.
         # Helps detect persons in shadows, backlit scenes, or dull backgrounds.
         proc_frame = _preprocess_frame(frame)
 
-        # FIX 9 – Upscale very small frames so small persons get more pixels.
+        # Upscale very small frames so small persons get more pixels.
         proc_frame, up_scale = _upscale_small_frame(proc_frame)
 
         original_h, original_w = frame.shape[:2]
@@ -601,7 +504,7 @@ class YoloDetector:
 
             # ------------------------------------------------------
             # MULTI-SCALE INFERENCE
-            # FIX 10 – Run at two resolutions and merge with NMS.
+            # Run at two resolutions and merge with NMS.
             # Primary pass (large imgsz) = fine detail for large persons.
             # Secondary pass (small imgsz) = global context for crowd/BG.
             # ------------------------------------------------------
@@ -691,9 +594,6 @@ class YoloDetector:
 
                 age = self._classify_age(bw, bh)
 
-                # ------------------------------------------
-                # FACE ROI + BODY HULL FROM KEYPOINTS
-                # ------------------------------------------
 
                 face_roi = None
                 hull     = None
@@ -711,7 +611,7 @@ class YoloDetector:
                         bbox=(x1, y1, x2, y2),
                     )
                 else:
-                    # FIX 11 – No keypoints at all: still build a full-bbox
+                    # No keypoints at all: still build a full-bbox
                     # hull so the person is masked.
                     dummy_kps = []
                     hull = self._body_polygon_from_keypoints(
@@ -719,9 +619,6 @@ class YoloDetector:
                         bbox=(x1, y1, x2, y2),
                     )
 
-                # ------------------------------------------
-                # KALMAN UPDATE OR INIT
-                # ------------------------------------------
 
                 if track_id in self.tracked_objects:
 
@@ -823,185 +720,8 @@ class YoloDetector:
 
 
 
-# ==========================================================
-# SEGMENTATION DETECTOR  (tight silhouette masking)
-# ==========================================================
-
-class SegmentationDetector:
-    """
-    Wraps a YOLO segmentation model (yolo11x-seg.pt) to produce pixel-accurate
-    instance masks that hug the body contour far more tightly than convex hulls.
-
-    Used when SILHOUETTE_MODE_ENABLED is True.  For each person detection the
-    seg model returns a binary mask; we extract its contour and pass it as the
-    "hull" field of the detection dict.  If the mask confidence is below
-    SILHOUETTE_MIN_CONF the entry hull is left as None so _mask_object falls
-    back to the convex-hull from the pose model.
-
-    Automatic fallback
-    ------------------
-    If the model file is missing or fails to load, `self.available` is set to
-    False.  The pipeline checks this flag and silently disables silhouette mode,
-    continuing with the regular pose-based convex hull.
-    """
-
-    def __init__(
-        self,
-        model_path: str   = SILHOUETTE_MODEL_PATH,
-        conf:       float = SILHOUETTE_MIN_CONF,
-        imgsz:      int   = IMGSZ_PRIMARY,
-    ):
-        self.conf      = conf
-        self.imgsz     = imgsz
-        self.available = False
-
-        try:
-            logging.info(f"[SegDet] Loading segmentation model: {model_path}")
-            self._model = YOLO(model_path)
-
-            self._device   = "cuda" if torch.cuda.is_available() else "cpu"
-            self._use_half = self._device == "cuda"
-            self._model.to(self._device)
-
-            self.available = True
-            logging.info(f"[SegDet] Segmentation model ready on {self._device}")
-
-        except Exception as e:
-            logging.warning(
-                f"[SegDet] Could not load seg model ({e}). "
-                "Silhouette mode disabled — falling back to convex hull."
-            )
-
-    # ----------------------------------------------------------
-    def get_masks(
-        self,
-        frame: np.ndarray,
-        detections: list,
-    ) -> list:
-        """
-        For each detection in *detections*, attempt to obtain a tight
-        segmentation contour from the seg model.
-
-        Returns a new list of detections where:
-          • hull  = tight contour polygon  (if seg succeeded)
-          • hull  = original convex hull   (if seg confidence too low or failed)
-
-        The original detection dicts are NOT modified in place; new dicts
-        are returned.
-        """
-        if not self.available:
-            return detections
-
-        h, w = frame.shape[:2]
-
-        try:
-            results = self._model.predict(
-                frame,
-                imgsz    = self.imgsz,
-                conf     = self.conf,
-                half     = self._use_half,
-                verbose  = False,
-                classes  = [0],   # person only
-            )
-        except Exception as e:
-            logging.warning(f"[SegDet] Inference error: {e} — using hull fallback")
-            return detections
-
-        if not results or results[0].masks is None:
-            return detections
-
-        result = results[0]
-        seg_masks   = result.masks.data.cpu().numpy()    # (N, H', W')
-        seg_confs   = result.boxes.conf.cpu().numpy()    # (N,)
-        seg_boxes   = result.boxes.xyxy.cpu().numpy()    # (N, 4)
-
-        updated = []
-
-        for det in detections:
-            dx, dy, dw, dh = det["bbox"]
-            det_x1 = dx;        det_y1 = dy
-            det_x2 = dx + dw;   det_y2 = dy + dh
-
-            best_iou   = 0.0
-            best_mask  = None
-
-            for seg_i, (sbox, sconf, smask) in enumerate(
-                zip(seg_boxes, seg_confs, seg_masks)
-            ):
-                if sconf < self.conf:
-                    continue
-
-                sx1, sy1, sx2, sy2 = sbox
-
-                # IoU between pose-model bbox and seg bbox
-                ix1 = max(det_x1, sx1);  iy1 = max(det_y1, sy1)
-                ix2 = min(det_x2, sx2);  iy2 = min(det_y2, sy2)
-                inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
-                if inter == 0:
-                    continue
-                union = (
-                    (det_x2 - det_x1) * (det_y2 - det_y1)
-                    + (sx2 - sx1) * (sy2 - sy1)
-                    - inter
-                )
-                iou = inter / union if union > 0 else 0.0
-
-                if iou > best_iou:
-                    best_iou  = iou
-                    best_mask = smask
-
-            if best_mask is not None and best_iou >= 0.25:
-                # Resize mask from YOLO's internal resolution to frame size
-                mask_resized = cv2.resize(
-                    best_mask.astype(np.uint8),
-                    (w, h),
-                    interpolation=cv2.INTER_NEAREST,
-                )
-                mask_bin = (mask_resized > 0.5).astype(np.uint8) * 255
-
-                # Extract contour as the tight hull
-                contours, _ = cv2.findContours(
-                    mask_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-                )
-
-                if contours:
-                    # Use the largest contour (main body)
-                    largest = max(contours, key=cv2.contourArea)
-
-                    # Light smoothing: approxPolyDP to reduce jitter between
-                    # frames while keeping the contour tight.
-                    epsilon = 0.005 * cv2.arcLength(largest, True)
-                    approx  = cv2.approxPolyDP(largest, epsilon, True)
-
-                    if len(approx) >= 3:
-                        new_det = dict(det)
-                        new_det["hull"]          = approx.astype(np.int32)
-                        new_det["seg_used"]      = True
-                        updated.append(new_det)
-                        continue   # success — skip fallback
-
-            # Fallback: keep original convex hull from pose model
-            new_det = dict(det)
-            new_det["seg_used"] = False
-            updated.append(new_det)
-
-        return updated
-
-
-# ==========================================================
-# DETECTOR SINGLETON
-# ==========================================================
-
 DETECTOR = YoloDetector()
 
-# Segmentation detector — instantiated only when feature is enabled.
-# If the model file is absent, SegmentationDetector.available is False
-# and the pipeline silently falls back to convex-hull mode.
-SEG_DETECTOR = SegmentationDetector() if SILHOUETTE_MODE_ENABLED else None
-
-# ==========================================================
-# DRAWING HELPERS
-# ==========================================================
 
 def _fill_polygon(
     frame: np.ndarray,
@@ -1026,9 +746,6 @@ def _fill_rect(
         frame[y1:y2, x1:x2] = color
     return frame
 
-# ==========================================================
-# MASKING
-# ==========================================================
 
 def _mask_object(
     frame: np.ndarray,
@@ -1046,11 +763,6 @@ def _mask_object(
     x = max(0, x);  y = max(0, y)
     w = max(1, w);  h = max(1, h)
 
-    # ======================================================
-    # FACE MODE  —  keypoint-derived ROI (with shoulder
-    # extrapolation fallback) or ratio-based last resort.
-    # ======================================================
-
     if mode == "face":
 
         if face_roi is not None:
@@ -1067,10 +779,7 @@ def _mask_object(
 
         frame = _fill_rect(frame, fx1, fy1, fx2, fy2, color)
 
-    # ======================================================
-    # BODY MODE  —  convex hull (now always present because
-    # _body_polygon_from_keypoints falls back to the bbox).
-    # ======================================================
+
 
     elif mode == "body":
 
@@ -1080,27 +789,10 @@ def _mask_object(
             # Ultimate safety net — should rarely be reached.
             frame = _fill_rect(frame, x, y, x + w, y + h, color)
 
-    # ======================================================
-    # SILHOUETTE MODE  —  tight segmentation contour.
-    # Drawn with fillPoly (works for non-convex polygons too).
-    # If no seg hull was obtained (seg_used=False) the convex
-    # hull from the pose model is used as an automatic fallback;
-    # if that is also absent we fall back to the bounding rect.
-    # ======================================================
-
-    elif mode == "silhouette":
-
-        if hull is not None:
-            # Works for both seg contours and convex hulls
-            cv2.fillPoly(frame, [hull], color)
-        else:
-            frame = _fill_rect(frame, x, y, x + w, y + h, color)
 
     return frame
 
-# ==========================================================
-# MAIN PUBLIC FUNCTION  (single-frame, no post-processing)
-# ==========================================================
+
 
 def anonymize_frame(
     frame: np.ndarray,
@@ -1114,13 +806,10 @@ def anonymize_frame(
     Supported modes
     ---------------
     "face"       — mask the head region only (keypoint ROI or ratio fallback)
+    Face doesnt work really well so far
+    
     "body"       — fill the full convex-hull silhouette (pose keypoints)
-    "silhouette" — tight pixel-accurate segmentation mask (requires
-                   yolo11x-seg.pt).  Automatically falls back per-person to
-                   the convex hull if seg confidence < SILHOUETTE_MIN_CONF,
-                   and to rectangles if the hull is also absent.
-                   If the seg model failed to load the whole frame silently
-                   uses "body" mode.
+
 
     Processing order (IMPORTANT — do not change):
       1. Pose-model detection (YOLO pose)
@@ -1142,34 +831,21 @@ def anonymize_frame(
     # 1. Pose-model detection
     detections = DETECTOR.detect(frame)
 
-    # 2. Silhouette refinement (seg model, if available and requested)
-    effective_mode = mode
-    if mode == "silhouette":
-        if SEG_DETECTOR is not None and SEG_DETECTOR.available:
-            detections = SEG_DETECTOR.get_masks(frame, detections)
-        else:
-            # Seg model unavailable — fall back to convex-hull body mode
-            logging.debug("Silhouette mode: seg model unavailable, using body mode")
-            effective_mode = "body"
-
-    # 3. Apply masks
+    # 2. Apply masks
     for detection in detections:
-        frame = _mask_object(frame, detection, effective_mode)
+        frame = _mask_object(frame, detection, mode)
 
-    # 4. Border crop (after masking)
+    # 3. Border crop (after masking)
     if border_crop:
         frame = apply_border_crop(frame)
 
-    # 5. Global blur — MUST be last; never interferes with CV pipeline
+    # 4. Global blur — MUST be last; never interferes with CV pipeline
     if global_blur:
         frame = apply_global_blur(frame)
 
     return frame
 
 
-# ==========================================================
-# TEMPORAL COHERENCE ENGINE
-# ==========================================================
 
 def _interpolate_hull(
     hull_before: np.ndarray,
@@ -1298,9 +974,6 @@ def _hull_to_bbox(hull: np.ndarray) -> tuple:
     return (int(x1), int(y1), int(x2 - x1), int(y2 - y1))
 
 
-# ==========================================================
-# VIDEO ANONYMIZER  (full pipeline with all features)
-# ==========================================================
 
 class VideoAnonymizer:
     """
@@ -1321,7 +994,7 @@ class VideoAnonymizer:
         va = VideoAnonymizer(
             input_path  = "input.mp4",
             output_path = "output_anonymized.mp4",
-            mode        = "silhouette",     # "face" | "body" | "silhouette"
+            mode        = "body",     # "face" | "body" |
             global_blur = True,
             border_crop = True,
             temporal_coherence = True,
@@ -1333,7 +1006,7 @@ class VideoAnonymizer:
         self,
         input_path:          str,
         output_path:         str,
-        mode:                str   = "silhouette",  # "face"|"body"|"silhouette"
+        mode:                str   = "body",  # "face"|"body"
         global_blur:         bool  = GLOBAL_BLUR_ENABLED,
         border_crop:         bool  = BORDER_CROP_ENABLED,
         temporal_coherence:  bool  = TEMPORAL_COHERENCE_ENABLED,
@@ -1349,16 +1022,6 @@ class VideoAnonymizer:
         self.blur_kernel        = blur_kernel
         self.crop_ratio         = crop_ratio
 
-        # Resolve effective mode: if silhouette requested but seg model
-        # is unavailable, silently downgrade to body mode at init time.
-        if mode == "silhouette" and (
-            SEG_DETECTOR is None or not SEG_DETECTOR.available
-        ):
-            logging.warning(
-                "[VideoAnonymizer] Silhouette mode requested but seg model "
-                "is unavailable — falling back to 'body' mode."
-            )
-            self.mode = "body" 
 
     # ----------------------------------------------------------
     def run(self):
@@ -1400,7 +1063,7 @@ class VideoAnonymizer:
 
             # Delegate to anonymize_frame which enforces the correct order:
             #   1. pose detection
-            #   2. seg refinement (silhouette mode)
+            #   2. seg refinement
             #   3. mask application
             #   4. border crop
             #   5. global blur  ← ALWAYS LAST, never touches CV input
