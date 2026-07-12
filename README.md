@@ -33,7 +33,7 @@ compliance review before wider distribution.
     open). Live/streaming input is not implemented — there is no stream
     reader, reconnect logic, or continuous-write handling in the code.
 
-## ⚙️ Features That Exist in the Code but Are NOT Wired to the CLI
+
 
 The `VideoAnonymizer` class in `src/anonymizer.py` supports additional
 capabilities, but **`main.py` does not use that class** — it calls
@@ -48,9 +48,6 @@ at their defaults (mostly off). To use them today you'd need to call
     frame as a final safety net, after all masking.
 *   **Border crop:** an optional crop of the frame edges to remove
     partially-detected faces that clip in/out at frame boundaries.
-*   **Silhouette refinement via a segmentation model** is referenced in a
-    docstring as a processing step, but no such model or code path currently
-    exists — only `face` and `body` modes are implemented.
 
 There is also no data-retention or source-deletion logic anywhere in the
 pipeline — any compliance workflow around deleting/archiving the original
@@ -127,9 +124,7 @@ python main.py \
 ```
 
 `--mode face` masks only the head region; `--mode body` masks the full
-tracked silhouette. There is currently no CLI flag for streaming sources,
-global blur, border crop, or temporal-coherence gap filling — see the
-"Features Not Wired to the CLI" section above if you need those.
+tracked silhouette.
 
 ***
 
