@@ -1,46 +1,94 @@
-# 🎥 Video Anonymization Pipeline: Advanced Tracking and Privacy Enforcement
+# 🎥 Video Anonymization Pipeline
 
 ## 📋 Project Goal
-To develop a robust, state-of-the-art framework for processing video streams to detect, track, and securely obscure Personally Identifiable Information (PII), ensuring maximum data privacy and compliance with global regulations (e.g., GDPR).
+A framework for processing local video files to detect people and obscure them
+(face or full body) for privacy purposes — e.g. preparing footage for GDPR-style
+compliance review before wider distribution.
 
-## ✨ Key Features & Enhancements
-This pipeline is a sophisticated solution designed to process high-resolution video feeds, whether from local files or simulated live streams.
+## ✨ Key Features (as implemented)
 
-*   **Deep Object Detection & Tracking:** Utilizes **YOLOv8/YOLOv11** for initial detection combined with **Kalman Filtering** and **Deep Sort** tracking algorithms. This ensures persistent identification of subjects across multiple frames, even during brief occlusions or camera movements.
-*   **Targeted Anonymization Modes:**
-    *   `face`: Blurs or pixelates a defined region around the detected human face.
-    *   `body`: Obscures the entire bounding box of the detected subject (full body).
-*   **Multi-Source Input:** Accepts local video files or can be architected for live/recorded video streams from HTTPS URLs.
-*   **Data Hygiene and Compliance:** Implements a structured workflow that confirms the secure handling and eventual deletion/archiving of the original sensitive video data, adhering to "Privacy by Design" principles.
-*   **Modular Design:** The core logic separates detection, tracking, and masking, allowing easy integration of advanced ML models (e.g., switching from YOLO to a specialized facial recognition model).
+*   **Detection & Tracking:** Uses a **YOLO pose model** (via `ultralytics`) for
+    per-frame person detection, combined with a custom **Kalman Filter** for
+    box smoothing and **ByteTrack** (`model.track(..., tracker="bytetrack.yaml")`)
+    for persistent track IDs across frames. *(No DeepSort is used anywhere in
+    the codebase.)*
+*   **Two anonymization modes:**
+    *   `face` — masks a region around the detected head, using facial
+      keypoints when available, with a ratio-based fallback when they aren't.
+      Per the code's own docstring, this mode is a work in progress and
+      doesn't perform as reliably as `body` yet.
+    *   `body` — fills a convex-hull silhouette built from pose keypoints
+      (falling back to the full bounding box if no keypoints are confident
+      enough).
+*   **Multi-scale inference:** each frame is run through the model at two
+    resolutions (1280px and 640px) and the results are merged with NMS, to
+    catch both close-up and distant/small people.
+*   **Low-light preprocessing:** CLAHE contrast enhancement is applied to each
+    frame before inference to help detect people in shadow or backlit scenes.
+*   **Experimental age-based mask color:** bounding boxes are classified as
+    "adult" (black mask) or "child" (white mask) based on a width/height
+    aspect-ratio heuristic. This is explicitly flagged in the source as not
+    working correctly yet — treat it as a placeholder, not a reliable feature.
+*   **Input:** local video files only (anything OpenCV's `VideoCapture` can
+    open). Live/streaming input is not implemented — there is no stream
+    reader, reconnect logic, or continuous-write handling in the code.
+
+## ⚙️ Features That Exist in the Code but Are NOT Wired to the CLI
+
+The `VideoAnonymizer` class in `src/anonymizer.py` supports additional
+capabilities, but **`main.py` does not use that class** — it calls
+`anonymize_frame()` directly in its own frame loop, with these options left
+at their defaults (mostly off). To use them today you'd need to call
+`VideoAnonymizer` yourself instead of running `main.py`:
+
+*   **Temporal coherence pass:** a second pass that interpolates masks across
+    short gaps where a tracked person was briefly lost (e.g. behind an
+    obstruction).
+*   **Global blur:** an optional light Gaussian blur applied to the whole
+    frame as a final safety net, after all masking.
+*   **Border crop:** an optional crop of the frame edges to remove
+    partially-detected faces that clip in/out at frame boundaries.
+*   **Silhouette refinement via a segmentation model** is referenced in a
+    docstring as a processing step, but no such model or code path currently
+    exists — only `face` and `body` modes are implemented.
+
+There is also no data-retention or source-deletion logic anywhere in the
+pipeline — any compliance workflow around deleting/archiving the original
+footage would need to be built and handled outside this codebase.
 
 ## 🏗️ System Architecture and Workflow
 
-The pipeline operates through a secure, three-stage system, leveraging object tracking for superior accuracy.
+### 1. Input Stage
+*   Loads a local video file via `cv2.VideoCapture`.
 
-### 1. Input Stage (Source Acquisition)
-The system handles data acquisition.
-*   **File Input:** Loads local video files (`.mp4`, etc.).
-*   **Stream Input (Planned):** Optimized to handle streaming protocols, reading frames efficiently for real-time processing.
+### 2. Core Processing Stage (per frame, in `anonymize_frame`)
+1.  **Detection (YOLO pose model):** identifies people and keypoints,
+    running at two scales and merging with NMS.
+2.  **Tracking (Kalman Filter + ByteTrack):** maintains a persistent ID per
+    person, predicting position on frames where a full detection pass is
+    skipped (`frame_skip`), and smoothing box size/position across frames.
+3.  **Masking:** fills either a face region or full-body convex hull with a
+    solid color, based on `--mode`.
+4.  *(Optional, not exposed via `main.py` today)* border crop, then global
+    blur — always applied last so they never affect what the detector sees.
 
-### 2. Core Processing Stage (Tracking & Anonymization)
-This is the heart of the system, executed frame-by-frame.
-
-*   **Detection (YOLO):** An optimized model identifies potential subjects (persons) and generates initial bounding boxes.
-*   **Tracking (Kalman Filter):** The tracking mechanism maintains a persistent ID for each detected object. When a subject is briefly lost or the detection confidence drops, the system uses the Kalman Filter to predict the object's next location and reacquire the bounding box, ensuring smoother, more consistent anonymization.
-*   **Transformation (Masking):** Based on the user-defined mode (`face` or `body`), the system applies masking techniques (e.g., solid black overlay, pixelation) to the tracked bounding box on the current frame.
-*   **Reassembly:** The newly masked frames are efficiently written to a new output video stream.
-
-### 3. Output Stage (Clean-up and Output)
-*   The fully anonymized video is saved to the specified output path.
-*   **Compliance Protocol:** The pipeline logs the completion and confirmation of the original source material's secure deletion/archiving, ensuring a complete audit trail.
+### 3. Output Stage
+*   The masked frames are written to the output path with `cv2.VideoWriter`
+    (`mp4v` codec).
 
 ## 🚀 Installation and Usage
 
 ### Prerequisites
 *   Python 3.8+
-*   `git` (Version Control)
-*   A CUDA-enabled GPU (Highly recommended for real-time performance)
+*   `git`
+*   A CUDA-enabled GPU is recommended but not required — the code checks
+    `torch.cuda.is_available()` and falls back to CPU automatically.
+*   A **pose-capable YOLO model** (e.g. `yolo11x-pose.pt`) — the detector
+    reads keypoints, so a plain object-detection weight file
+    (`yolo11x.pt`) will not produce keypoints and `face`/`body` masking
+    quality will degrade to bounding-box fallbacks only. Download an
+    appropriate `-pose` weight file from Ultralytics and place it at
+    `models/yolo11x.pt` (or update `model_path` in `YoloDetector`).
 
 ### Installation Steps
 1.  **Clone the Repository:**
@@ -55,17 +103,21 @@ This is the heart of the system, executed frame-by-frame.
     # venv\Scripts\activate    # On Windows
     ```
 3.  **Install Dependencies:**
-    *(Note: These dependencies include `torch`, `ultralytics`, and `opencv-python`)*
     ```bash
     pip install -r requirements.txt
     ```
+    See the comments in `requirements.txt` if you're installing on a
+    CPU-only machine (no CUDA GPU).
+4.  **Add a model file:**
+    ```bash
+    mkdir -p models
+    # place a pose-capable YOLO weight file here, e.g. yolo11x-pose.pt
+    ```
 
-### Usage Guide (Running the Pipeline)
+### Usage Guide
 
-The primary entry point is `main.py`. You must define your input source, output path, and the desired anonymization strategy.
-
-**A. From a Local Video File**
-Use this method when you have downloaded the video source.
+The entry point is `main.py`. It requires an input file, an output path, and
+a mode (`face` or `body`):
 
 ```bash
 python main.py \
@@ -74,22 +126,24 @@ python main.py \
     --mode body
 ```
 
-**B. From a Live/Online Stream (Future Implementation)**
-When adapted for streaming, the input path will point to the stream URL, and the processing loop will run continuously until interrupted.
-
-```bash
-# Example syntax for a live feed (implementation pending advanced stream reader)
-python main.py \
-    --input "rtsp://ip_address:port" \
-    --output data/live_anon.mp4 \
-    --mode face
-```
+`--mode face` masks only the head region; `--mode body` masks the full
+tracked silhouette. There is currently no CLI flag for streaming sources,
+global blur, border crop, or temporal-coherence gap filling — see the
+"Features Not Wired to the CLI" section above if you need those.
 
 ***
 
 ### 🎯 Technical Notes & Design Decisions
 
-*   **Object Tracking Robustness:** By using a combination of YOLO detection and Kalman filtering, the system moves beyond simple frame-by-frame detection. It maintains a *track* of the individual, which is critical for masking consistency when subjects move quickly or briefly exit the frame.
-*   **Scalability:** The detection layer is encapsulated within the `YoloDetector` class, making it trivial to swap out the backbone model (e.g., replacing YOLO with a specialized facial recognition API without changing the core anonymization logic).
-*   **Resource Management:** The `main.py` structure includes explicit `try...finally` blocks to ensure that both the video capture object (`cap`) and the video writer object (`out`) are always correctly released, preventing resource leaks.
-*   **Error Handling:** The inclusion of detailed logging and exception handling ensures that the pipeline gracefully fails and reports the exact point of failure.
+*   **Tracking:** Kalman Filter (per-track state prediction/smoothing) +
+    ByteTrack (via `ultralytics`'s `model.track()`) for ID persistence —
+    **not** DeepSort.
+*   **`frame_skip`:** full detection inference doesn't run on every frame;
+    on skipped frames, box positions are predicted from the Kalman Filter
+    instead, trading some accuracy for speed.
+*   **Resource management:** `main.py` uses `try...finally` to ensure the
+    video capture and writer objects are always released.
+*   **Known limitations:** `face` mode is noted in the source as less
+    reliable than `body` mode; the child/adult classification heuristic is
+    marked as not functioning correctly yet; there's no live/stream input
+    support despite `VideoCapture` technically accepting network URLs.
