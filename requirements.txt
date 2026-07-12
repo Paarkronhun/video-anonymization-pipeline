@@ -2,14 +2,21 @@
 
 # --- Core CV and Math Libraries ---
 opencv-python>=4.5.5
-numpy<2
+numpy<2   # pinned below 2.x for compatibility with torch==2.7.0 / ultralytics==8.3.123
 
-# --- Deep Learning Frameworks (Choose ONE major back-end) ---
-# Recommendation: Use torch for the best performance with modern YOLO models.
-
+# --- Deep Learning Frameworks ---
+# torch + torchvision are required (src/anonymizer.py imports torch directly
+# for CUDA detection, and ultralytics depends on torch internally).
+#
+# The CUDA 12.6 wheel index below is only needed for GPU installs.
+# CPU-only users can safely delete the --extra-index-url line and the
+# "+cu126" suffixes; the code already falls back to CPU automatically
+# (torch.cuda.is_available() check in YoloDetector.__init__).
 --extra-index-url https://download.pytorch.org/whl/cu126
 torch==2.7.0
 torchvision==0.22.0+cu126
 
-# For running YOLO models efficiently, using ultralytics is highly recommended.
-ultralytics==8.3.123 
+# ultralytics provides the YOLO() class used for both detection and
+# ByteTrack-based tracking (model.track(..., tracker="bytetrack.yaml")).
+# NOTE: this project does NOT use DeepSort, despite what older docs said.
+ultralytics==8.3.123
